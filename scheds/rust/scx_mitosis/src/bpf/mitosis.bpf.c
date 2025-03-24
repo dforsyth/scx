@@ -33,6 +33,7 @@ const volatile bool debug = false;
 const volatile u32 nr_possible_cpus = 1;
 const volatile bool smt_enabled = true;
 const volatile unsigned char all_cpus[MAX_CPUS_U8];
+const volatile bool allow_root_cell_only;
 
 const volatile u64 slice_ns;
 
@@ -965,7 +966,7 @@ s32 BPF_STRUCT_OPS(mitosis_cgroup_init, struct cgroup *cgrp,
 				}
 			}
 		}
-		if (all_cpumask && bpf_cpumask_subset((const struct cpumask *)all_cpumask, cpumask))
+		if (all_cpumask && bpf_cpumask_subset((const struct cpumask *)all_cpumask, cpumask) && !allow_root_cell_only)
 			scx_bpf_error("cell cpumask is all cpus");
 		cpumask = bpf_kptr_xchg(&cell_cpumaskw->cpumask, cpumask);
 		if (!cpumask) {

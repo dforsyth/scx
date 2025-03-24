@@ -21,6 +21,7 @@ use anyhow::Context;
 use anyhow::Result;
 use cgroupfs::CgroupReader;
 use clap::Parser;
+use itertools::multizip;
 use libbpf_rs::skel::OpenSkel;
 use libbpf_rs::skel::Skel;
 use libbpf_rs::skel::SkelBuilder;
@@ -44,6 +45,10 @@ use scx_utils::NR_CPUS_POSSIBLE;
 use scx_utils::NR_CPU_IDS;
 
 const MAX_CELLS: usize = bpf_intf::consts_MAX_CELLS as usize;
+const CSTAT_LOCAL: usize = bpf_intf::cell_stat_idx_CSTAT_LOCAL as usize;
+const CSTAT_GLOBAL: usize = bpf_intf::cell_stat_idx_CSTAT_GLOBAL as usize;
+const CSTAT_AFFN_VIOL: usize = bpf_intf::cell_stat_idx_CSTAT_AFFN_VIOL as usize;
+const NR_CSTATS: usize = bpf_intf::cell_stat_idx_NR_CSTATS as usize;
 
 /// scx_mitosis: A dynamic affinity scheduler
 ///
@@ -74,10 +79,48 @@ struct Opts {
     /// Interval to report monitoring information
     #[clap(long, default_value = "1")]
     monitor_interval_s: u64,
+
+    /// Run mitosis even if we only have a single (root) cell.
+    #[clap(long, default_value = "false")]
+    allow_root_cell_only: bool,
 }
 
 unsafe fn any_as_u8_slice<T: Sized>(p: &T) -> &[u8] {
     ::std::slice::from_raw_parts((p as *const T) as *const u8, ::std::mem::size_of::<T>())
+}
+
+fn read_cpu_ctxs(skel: &BpfSkel) -> Result<Vec<bpf_intf::cpu_ctx>> {
+    let mut cpu_ctxs = vec![];
+    let cpu_ctxs_vec = skel
+        .maps
+        .cpu_ctxs
+        .lookup_percpu(&0u32.to_ne_bytes(), libbpf_rs::MapFlags::ANY)
+        .context("Failed to lookup cpu_ctx")?
+        .unwrap();
+    for cpu in 0..*NR_CPUS_POSSIBLE {
+        cpu_ctxs.push(*unsafe {
+            &*(cpu_ctxs_vec[cpu].as_slice().as_ptr() as *const bpf_intf::cpu_ctx)
+        });
+    }
+    Ok(cpu_ctxs)
+}
+
+#[derive(Clone, Debug, Default)]
+struct CellCost {
+    percpu_cycles: Vec<u64>,
+
+    stats_local: u64,
+    stats_global: u64,
+    stats_affn_viol: u64,
+}
+
+impl CellCost {
+    fn new() -> Self {
+        Self {
+            percpu_cycles: vec![0; *NR_CPU_IDS],
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -88,13 +131,15 @@ unsafe fn any_as_u8_slice<T: Sized>(p: &T) -> &[u8] {
 // be the cpus of the root cell.
 struct Cell {
     cpu_assignment: BTreeSet<u32>,
+
+    cost: CellCost,
+    prev_cost: CellCost,
 }
 
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     cells: BTreeMap<u32, Cell>,
     cgroup_to_cell: HashMap<String, u32>,
-    prev_percpu_cell_cycles: Vec<[u64; MAX_CELLS]>,
     monitor_interval: std::time::Duration,
 }
 
@@ -114,6 +159,9 @@ impl<'a> Scheduler<'a> {
         if opts.verbose >= 1 {
             skel.maps.rodata_data.debug = true;
         }
+        if opts.allow_root_cell_only {
+            skel.maps.rodata_data.allow_root_cell_only = true;
+        }
         skel.maps.rodata_data.nr_possible_cpus = *NR_CPUS_POSSIBLE as u32;
         for cpu in topology.all_cores.keys() {
             skel.maps.rodata_data.all_cpus[cpu / 8] |= 1 << (cpu % 8);
@@ -131,6 +179,8 @@ impl<'a> Scheduler<'a> {
                 .cloned()
                 .map(|x| x as u32)
                 .collect(),
+            cost: CellCost::new(),
+            prev_cost: CellCost::new(),
         };
         let mut cgroup_to_cell = hashmap! {
             "".to_string() => 0
@@ -179,6 +229,8 @@ impl<'a> Scheduler<'a> {
                     num_cells,
                     Cell {
                         cpu_assignment: cpuset.cpus,
+                        cost: CellCost::new(),
+                        prev_cost: CellCost::new(),
                     },
                 );
                 cgroup_to_cell.insert(cg_name, num_cells);
@@ -191,7 +243,6 @@ impl<'a> Scheduler<'a> {
             skel,
             cells,
             cgroup_to_cell,
-            prev_percpu_cell_cycles: vec![[0; MAX_CELLS]; *NR_CPU_IDS],
             monitor_interval: std::time::Duration::from_secs(opts.monitor_interval_s),
         })
     }
@@ -203,6 +254,7 @@ impl<'a> Scheduler<'a> {
         info!("Mitosis Scheduler Attached");
         while !shutdown.load(Ordering::Relaxed) && !uei_exited!(&self.skel, uei) {
             std::thread::sleep(self.monitor_interval);
+            self.refresh_cell_costs()?;
             self.debug()?;
             if self.skel.maps.bss_data.user_global_seq != self.skel.maps.bss_data.global_seq {
                 trace!("BPF reconfiguration still in progress, skipping further changes");
@@ -254,31 +306,66 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    /// Output various debugging data like per cell stats, per-cpu stats, etc.
-    fn debug(&mut self) -> Result<()> {
-        let zero = 0 as libc::__u32;
-        let zero_slice = unsafe { any_as_u8_slice(&zero) };
-        if let Some(v) = self
-            .skel
-            .maps
-            .cpu_ctxs
-            .lookup_percpu(zero_slice, libbpf_rs::MapFlags::ANY)
-            .context("Failed to lookup cpu_ctxs map")?
-        {
-            for (cpu, ctx) in v.iter().enumerate() {
-                let cpu_ctx = unsafe {
-                    let ptr = ctx.as_slice().as_ptr() as *const bpf_intf::cpu_ctx;
-                    &*ptr
-                };
-                let diff_cycles: Vec<i64> = self.prev_percpu_cell_cycles[cpu]
-                    .iter()
-                    .zip(cpu_ctx.cell_cycles.iter())
-                    .map(|(a, b)| (b - a) as i64)
-                    .collect();
-                self.prev_percpu_cell_cycles[cpu] = cpu_ctx.cell_cycles;
-                trace!("CPU {}: {:?}", cpu, diff_cycles);
+    fn refresh_cell_costs(&mut self) -> Result<()> {
+        let cpu_ctxs = read_cpu_ctxs(&self.skel)
+            .context("Failed to read cpu ctxs")
+            .unwrap();
+
+        let nr_cpus = cpu_ctxs.len();
+
+        let mut cell_percpu_cycles = vec![vec![0u64; nr_cpus]; MAX_CELLS];
+        let mut cell_stats = vec![vec![0u64; NR_CSTATS]; MAX_CELLS];
+
+        for (cpu, ctx) in cpu_ctxs.iter().enumerate() {
+            for (cell_id, _) in &self.cells {
+                let cell_idx = *cell_id as usize;
+                cell_percpu_cycles[cell_idx][cpu] = ctx.cell_cycles[cell_idx];
+
+                for stat in 0..NR_CSTATS {
+                    cell_stats[cell_idx][stat] = ctx.cstats[cell_idx][stat];
+                }
             }
         }
+
+        for ((_, cell), percpu_cycles, stats) in
+            multizip((&mut self.cells, cell_percpu_cycles.iter(), &cell_stats))
+        {
+            // XXX
+            cell.prev_cost = cell.cost.clone();
+            cell.cost = CellCost {
+                percpu_cycles: percpu_cycles.to_vec(),
+                stats_local: stats[CSTAT_LOCAL],
+                stats_global: stats[CSTAT_GLOBAL],
+                stats_affn_viol: stats[CSTAT_AFFN_VIOL],
+            };
+        }
+
+        Ok(())
+    }
+
+    /// Output various debugging data like per cell stats, per-cpu stats, etc.
+    fn debug(&mut self) -> Result<()> {
+        let mut diff_cycles = vec![[0u64; MAX_CELLS]; *NR_CPU_IDS];
+        for (cell_id, cell) in self.cells.iter() {
+            let percpu_cycles_deltas: Vec<u64> = cell
+                .cost
+                .percpu_cycles
+                .iter()
+                .zip(cell.prev_cost.percpu_cycles.iter())
+                .map(|(a, b)| a - b)
+                .collect();
+
+            for cpu in 0..*NR_CPU_IDS {
+                diff_cycles[cpu][*cell_id as usize] = percpu_cycles_deltas[cpu];
+            }
+
+            // trace!("Cell {}: {:?}", cell_id, cell);
+        }
+
+        for cpu in 0..*NR_CPU_IDS {
+            trace!("CPU {}: {:?}", cpu, diff_cycles[cpu]);
+        }
+
         Ok(())
     }
 }
