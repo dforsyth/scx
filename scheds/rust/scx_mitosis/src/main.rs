@@ -6,12 +6,15 @@ mod bpf_skel;
 pub use bpf_skel::*;
 pub mod bpf_intf;
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 
+use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
@@ -20,6 +23,7 @@ use libbpf_rs::OpenObject;
 use log::debug;
 use log::info;
 use log::trace;
+use resctrlfs::ResctrlReader;
 use scx_utils::init_libbpf_logging;
 use scx_utils::scx_enums;
 use scx_utils::scx_ops_attach;
@@ -72,6 +76,41 @@ unsafe fn any_as_u8_slice<T: Sized>(p: &T) -> &[u8] {
     }
 }
 
+#[derive(Debug)]
+struct CellStats {
+    collected_time: Instant,
+    l3_to_mbm_total: BTreeMap<usize, u64>,
+}
+
+impl CellStats {
+    fn gen_l3_to_mbm_total(
+        cell: &Cell,
+        mbm: &HashMap<Cpumask, BTreeMap<usize, u64>>,
+    ) -> Result<BTreeMap<usize, u64>> {
+        // assume that a mon group is at least exclusive to a cell.
+
+        let mut l3_to_mbm_total = BTreeMap::new();
+        let mut assumed_cpus = Cpumask::new();
+        // group cpus -> usage per l3
+        for (cpus, l3_mbm_total_bytes) in mbm {
+            if cell.cpus.and(cpus).eq(cpus) {
+                for (&l3, &mbm_total_bytes) in l3_mbm_total_bytes.iter() {
+                    l3_to_mbm_total.insert(l3, mbm_total_bytes);
+                }
+
+                // accounting
+                assumed_cpus = assumed_cpus.or(cpus);
+            }
+        }
+
+        if assumed_cpus != cell.cpus {
+            bail!("assumed_cpus != cell.cpus");
+        }
+
+        Ok(l3_to_mbm_total)
+    }
+}
+
 // Per cell book-keeping
 #[derive(Debug)]
 struct Cell {
@@ -83,6 +122,8 @@ struct Scheduler<'a> {
     prev_percpu_cell_cycles: Vec<[u64; MAX_CELLS]>,
     monitor_interval: std::time::Duration,
     cells: HashMap<u32, Cell>,
+    cell_stats: BTreeMap<u32, Arc<CellStats>>,
+    prev_cell_stats: BTreeMap<u32, Arc<CellStats>>,
 }
 
 impl<'a> Scheduler<'a> {
@@ -110,6 +151,8 @@ impl<'a> Scheduler<'a> {
             prev_percpu_cell_cycles: vec![[0; MAX_CELLS]; *NR_CPU_IDS],
             monitor_interval: std::time::Duration::from_secs(opts.monitor_interval_s),
             cells: HashMap::new(),
+            cell_stats: BTreeMap::new(),
+            prev_cell_stats: BTreeMap::new(),
         })
     }
 
@@ -119,6 +162,7 @@ impl<'a> Scheduler<'a> {
         while !shutdown.load(Ordering::Relaxed) && !uei_exited!(&self.skel, uei) {
             std::thread::sleep(self.monitor_interval);
             self.refresh_bpf_cells()?;
+            self.collect_cell_stats()?;
             self.debug()?;
         }
         drop(struct_ops);
@@ -151,9 +195,10 @@ impl<'a> Scheduler<'a> {
             }
         }
 
-        for (cell_id, cell) in &self.cells {
-            trace!("CELL[{}]: {}", cell_id, cell.cpus);
+        for (cell_id, cell_stats) in &self.cell_stats {
+            trace!("CELL {}: {:?}", cell_id, cell_stats.l3_to_mbm_total);
         }
+
         Ok(())
     }
 
@@ -191,6 +236,32 @@ impl<'a> Scheduler<'a> {
 
         Ok(())
     }
+
+    fn collect_cell_stats(&mut self) -> Result<()> {
+        let collected_time = Instant::now();
+        // move prev stats. check for dead cells.
+        while let Some((cell_id, stats)) = self.cell_stats.pop_first() {
+            if self.cells.contains_key(&cell_id) {
+                self.prev_cell_stats.insert(cell_id, stats);
+            }
+        }
+
+        let resctrl_membw = read_resctrl_membw()?;
+        for (&cell_id, cell) in &self.cells {
+            // no need to collect stats for root
+            if cell_id == 0 {
+                continue;
+            }
+
+            let stats = Arc::new(CellStats {
+                collected_time,
+                l3_to_mbm_total: CellStats::gen_l3_to_mbm_total(&cell, &resctrl_membw)?,
+            });
+            self.cell_stats.insert(cell_id, stats);
+        }
+
+        Ok(())
+    }
 }
 
 fn read_cpu_ctxs(skel: &BpfSkel) -> Result<Vec<bpf_intf::cpu_ctx>> {
@@ -207,6 +278,73 @@ fn read_cpu_ctxs(skel: &BpfSkel) -> Result<Vec<bpf_intf::cpu_ctx>> {
         });
     }
     Ok(cpu_ctxs)
+}
+
+fn cpuset_to_cpumask(cpuset: &resctrlfs::Cpuset) -> Cpumask {
+    let mut cpumask = Cpumask::new();
+    for x in &cpuset.cpus {
+        cpumask.set_cpu(*x as usize).expect("cast to usize");
+    }
+    return cpumask;
+}
+
+fn read_resctrl_membw() -> Result<HashMap<Cpumask, BTreeMap<usize, u64>>> {
+    // map ctrl mon groups (by cpu) to mbm bytes per l3
+    let reader = ResctrlReader::new("/sys/fs/resctrl".into(), true)?;
+    let sample = reader.read_all()?;
+
+    let mut mon_grp_to_l3_usage = HashMap::new();
+
+    // im sorry.
+    if let Some(mon_groups) = &sample.mon_groups {
+        for (mon_group_id, mon_group) in mon_groups {
+            let mut l3_usage = BTreeMap::new();
+            if let Some(cpuset) = &mon_group.cpuset {
+                if let Some(mon_stat) = &mon_group.mon_stat {
+                    if let Some(l3_mon_stat) = &mon_stat.l3_mon_stat {
+                        for (&l3, stat) in l3_mon_stat.iter() {
+                            if let Some(rmid_bytes) = &stat.mbm_total_bytes {
+                                if let resctrlfs::RmidBytes::Bytes(b) = rmid_bytes {
+                                    l3_usage.insert(l3 as usize, *b);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let cpumask = cpuset_to_cpumask(cpuset);
+                mon_grp_to_l3_usage.insert(cpumask, l3_usage);
+            }
+        }
+    }
+
+    if let Some(ctrl_mon_groups) = &sample.ctrl_mon_groups {
+        for (ctrl_mon_group_id, ctrl_mon_group) in ctrl_mon_groups.iter() {
+            if let Some(mon_groups) = &ctrl_mon_group.mon_groups {
+                for (mon_group_id, mon_group) in mon_groups.iter() {
+                    if let Some(cpuset) = &mon_group.cpuset {
+                        let mut l3_usage = BTreeMap::new();
+                        if let Some(mon_stat) = &mon_group.mon_stat {
+                            if let Some(l3_mon_stat) = &mon_stat.l3_mon_stat {
+                                for (&l3, stat) in l3_mon_stat.iter() {
+                                    if let Some(rmid_bytes) = &stat.mbm_total_bytes {
+                                        if let resctrlfs::RmidBytes::Bytes(b) = &rmid_bytes {
+                                            l3_usage.insert(l3 as usize, *b);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        let cpumask = cpuset_to_cpumask(cpuset);
+                        mon_grp_to_l3_usage.insert(cpumask, l3_usage);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(mon_grp_to_l3_usage)
 }
 
 fn main() -> Result<()> {
