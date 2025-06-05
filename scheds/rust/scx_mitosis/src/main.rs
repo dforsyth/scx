@@ -17,6 +17,7 @@ use std::time::Instant;
 use anyhow::bail;
 use anyhow::Context;
 use anyhow::Result;
+use byte_unit::{Byte, Unit};
 use clap::Parser;
 use libbpf_rs::MapCore as _;
 use libbpf_rs::OpenObject;
@@ -68,6 +69,9 @@ struct Opts {
     /// Interval to report monitoring information
     #[clap(long, default_value = "1")]
     monitor_interval_s: u64,
+
+    #[clap(long, default_value = "20")]
+    membw_per_l3_gbps: f32,
 }
 
 unsafe fn any_as_u8_slice<T: Sized>(p: &T) -> &[u8] {
@@ -91,9 +95,10 @@ impl CellStats {
 
         let mut l3_to_mbm_total = BTreeMap::new();
         let mut assumed_cpus = Cpumask::new();
+
         // group cpus -> usage per l3
         for (cpus, l3_mbm_total_bytes) in mbm {
-            if cell.cpus.and(cpus).eq(cpus) {
+            if cell.cpus.and(cpus) == *cpus {
                 for (&l3, &mbm_total_bytes) in l3_mbm_total_bytes.iter() {
                     l3_to_mbm_total.insert(l3, mbm_total_bytes);
                 }
@@ -124,6 +129,9 @@ struct Scheduler<'a> {
     cells: HashMap<u32, Cell>,
     cell_stats: BTreeMap<u32, Arc<CellStats>>,
     prev_cell_stats: BTreeMap<u32, Arc<CellStats>>,
+    topology: Topology,
+    cpu_to_l3_id: BTreeMap<usize, usize>,
+    membw_per_l3_gbps: f32,
 }
 
 impl<'a> Scheduler<'a> {
@@ -137,11 +145,25 @@ impl<'a> Scheduler<'a> {
 
         skel.struct_ops.mitosis_mut().exit_dump_len = opts.exit_dump_len;
 
-        skel.maps.rodata_data.slice_ns = scx_enums.SCX_SLICE_DFL;
+        skel.maps.rodata_data.slice_ns = std::cmp::min(
+            scx_enums.SCX_SLICE_DFL / 20,
+            std::time::Duration::from_secs(1).as_nanos() as u64,
+        );
+
+        skel.maps.rodata_data.l3_throttle_period_ns =
+            std::time::Duration::from_secs(1).as_nanos() as u64;
 
         skel.maps.rodata_data.nr_possible_cpus = *NR_CPUS_POSSIBLE as u32;
-        for cpu in topology.all_cores.keys() {
-            skel.maps.rodata_data.all_cpus[cpu / 8] |= 1 << (cpu % 8);
+        // TODO: do we want all_cpus?
+        let mut cpu_to_l3_id = BTreeMap::new();
+        for (cpu_id, cpu) in topology.all_cores.iter() {
+            skel.maps.rodata_data.all_cpus[cpu_id / 8] |= 1 << (cpu_id % 8);
+
+            // llc_id != l3_id
+            for (actual_cpu_id, actual_cpu) in cpu.cpus.iter() {
+                cpu_to_l3_id.insert(*actual_cpu_id, actual_cpu.l3_id);
+                skel.maps.rodata_data.cpu_to_l3_id_map[*actual_cpu_id] = actual_cpu.l3_id as u32;
+            }
         }
 
         let skel = scx_ops_load!(skel, mitosis, uei)?;
@@ -153,6 +175,9 @@ impl<'a> Scheduler<'a> {
             cells: HashMap::new(),
             cell_stats: BTreeMap::new(),
             prev_cell_stats: BTreeMap::new(),
+            topology,
+            cpu_to_l3_id,
+            membw_per_l3_gbps: opts.membw_per_l3_gbps,
         })
     }
 
@@ -163,6 +188,7 @@ impl<'a> Scheduler<'a> {
             std::thread::sleep(self.monitor_interval);
             self.refresh_bpf_cells()?;
             self.collect_cell_stats()?;
+            self.update_cells()?;
             self.debug()?;
         }
         drop(struct_ops);
@@ -191,7 +217,7 @@ impl<'a> Scheduler<'a> {
                     .map(|(a, b)| (b - a) as i64)
                     .collect();
                 self.prev_percpu_cell_cycles[cpu] = cpu_ctx.cell_cycles;
-                trace!("CPU {}: {:?}", cpu, diff_cycles);
+                // trace!("CPU {}: {:?}", cpu, diff_cycles);
             }
         }
 
@@ -229,6 +255,11 @@ impl<'a> Scheduler<'a> {
                         .expect("missing cell in cpu map")
                         .clone(),
                 });
+                trace!(
+                    "CELL[{}]: {} cpus",
+                    cell_idx,
+                    self.cells.get(&cell_idx).expect("cpus").cpus.weight()
+                );
             } else {
                 self.cells.remove(&cell_idx);
             }
@@ -258,6 +289,86 @@ impl<'a> Scheduler<'a> {
                 l3_to_mbm_total: CellStats::gen_l3_to_mbm_total(&cell, &resctrl_membw)?,
             });
             self.cell_stats.insert(cell_id, stats);
+        }
+
+        Ok(())
+    }
+
+    fn update_cells(&mut self) -> Result<()> {
+        let mut l3_total_map = BTreeMap::new();
+        for (cpu, l3_id) in self.cpu_to_l3_id.iter() {
+            l3_total_map
+                .entry(l3_id)
+                .and_modify(|cnt| *cnt += 1)
+                .or_insert(1);
+        }
+
+        let max_membw_bytes = Byte::from_f32_with_unit(self.membw_per_l3_gbps, Unit::GB).unwrap();
+        for (cell_id, cell) in &self.cells {
+            // skip the root cell
+            if *cell_id == 0 {
+                continue;
+            }
+
+            let mut l3_cpus = BTreeMap::new();
+            for cpu in cell.cpus.iter() {
+                let l3_id = self.cpu_to_l3_id.get(&cpu).unwrap();
+                l3_cpus
+                    .entry(l3_id)
+                    .and_modify(|cnt| *cnt += 1)
+                    .or_insert(1);
+            }
+
+            trace!("CELL[{}] CPUS: {:?}", cell_id, l3_cpus);
+            if let Some(stats) = self.cell_stats.get(&cell_id) {
+                if let Some(prev_stats) = self.prev_cell_stats.get(&cell_id) {
+                    let delta_time = stats
+                        .collected_time
+                        .duration_since(prev_stats.collected_time);
+
+                    for (l3, mbm_total) in stats.l3_to_mbm_total.iter() {
+                        // We can only compute a delta if we have been
+                        // accounting for the l3 since the last interval.
+                        if let Some(prev_mbm_total) = prev_stats.l3_to_mbm_total.get(l3) {
+                            let prev = self.skel.maps.bss_data.cells[*cell_id as usize]
+                                .l3_runtime_ns[*l3 as usize];
+                            if prev_mbm_total >= mbm_total {
+                                continue;
+                            }
+                            let mbm_delta_bytes = mbm_total - prev_mbm_total;
+
+                            let cpu_cnt = l3_cpus.get(l3).unwrap();
+                            let l3_total = l3_total_map.get(l3).unwrap();
+
+                            let observed_bps =
+                                (mbm_delta_bytes as f32 / delta_time.as_secs_f32()) as u64;
+
+                            let frac_max_membw_bps =
+                                max_membw_bytes.divide(*l3_total).unwrap().as_u64() * *cpu_cnt;
+
+                            let runtime = if observed_bps <= frac_max_membw_bps {
+                                0
+                            } else {
+                                std::time::Duration::from_secs_f32(
+                                    frac_max_membw_bps as f32 / observed_bps as f32,
+                                )
+                                .as_nanos() as u64
+                            };
+                            if runtime > 0 {
+                                trace!(
+                                    "limiting to {}/{}ns for {} on {}",
+                                    runtime,
+                                    frac_max_membw_bps,
+                                    cell_id,
+                                    l3,
+                                );
+                            }
+                            self.skel.maps.bss_data.cells[*cell_id as usize].l3_runtime_ns
+                                [*l3 as usize] = runtime;
+                        }
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -305,6 +416,10 @@ fn read_resctrl_membw() -> Result<HashMap<Cpumask, BTreeMap<usize, u64>>> {
                         for (&l3, stat) in l3_mon_stat.iter() {
                             if let Some(rmid_bytes) = &stat.mbm_total_bytes {
                                 if let resctrlfs::RmidBytes::Bytes(b) = rmid_bytes {
+                                    // Something is up with rmids?
+                                    if *b == 0 {
+                                        continue;
+                                    }
                                     l3_usage.insert(l3 as usize, *b);
                                 }
                             }
@@ -329,6 +444,10 @@ fn read_resctrl_membw() -> Result<HashMap<Cpumask, BTreeMap<usize, u64>>> {
                                 for (&l3, stat) in l3_mon_stat.iter() {
                                     if let Some(rmid_bytes) = &stat.mbm_total_bytes {
                                         if let resctrlfs::RmidBytes::Bytes(b) = &rmid_bytes {
+                                            // Something is up with rmids?
+                                            if *b == 0 {
+                                                continue;
+                                            }
                                             l3_usage.insert(l3 as usize, *b);
                                         }
                                     }

@@ -25,6 +25,7 @@ enum consts {
 	MAX_CPUS_U8 = MAX_CPUS / 8,
 	MAX_CELLS = 16,
 	USAGE_HALF_LIFE = 100000000, /* 100ms */
+	MAX_L3S = 64,
 
 	HI_FALLBACK_DSQ = MAX_CELLS,
 	LO_FALLBACK_DSQ = MAX_CELLS + 1,
@@ -35,6 +36,9 @@ enum cell_stat_idx {
 	CSTAT_LOCAL,
 	CSTAT_GLOBAL,
 	CSTAT_AFFN_VIOL,
+	// XXX this should really be moved to the cell or
+	// tracked as a llc stat.
+	CSTAT_MEMBW_THROTTLE,
 	NR_CSTATS,
 };
 
@@ -43,6 +47,7 @@ struct cpu_ctx {
 	u64 cell_cycles[MAX_CELLS];
 	u32 prev_cell;
 	u32 cell;
+	u64 started_at;
 };
 
 struct cgrp_ctx {
@@ -60,6 +65,13 @@ struct cell {
 	u32 dsq;
 	// Whether or not the cell is used or not
 	u32 in_use;
+
+	// max execution time (per sec) on a given llc in ns
+	u64 l3_runtime_ns[MAX_L3S];
+	// used execution time over the last period
+	u64 l3_used_ns[MAX_L3S];
+	// when we started monitoring runtime, reset after every period.
+	u64 l3_start_ns[MAX_L3S];
 };
 
 #endif /* __INTF_H */

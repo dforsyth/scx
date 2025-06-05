@@ -31,8 +31,13 @@ char _license[] SEC("license") = "GPL";
 const volatile u32 nr_possible_cpus = 1;
 const volatile bool smt_enabled = true;
 const volatile unsigned char all_cpus[MAX_CPUS_U8];
+const volatile u32 cpu_to_l3_id_map[MAX_CPUS];
 
 const volatile u64 slice_ns;
+
+const volatile u64 l3_throttle_period_ns;
+
+extern unsigned CONFIG_HZ __kconfig;
 
 /*
  * CPU assignment changes aren't fully in effect until a subsequent tick()
@@ -204,6 +209,10 @@ static inline int free_cell(int cell_idx)
  * explicit map to allow for these to be kptrs.
  */
 struct cell_cpumask_wrapper {
+	// I'm just stashing this here because we need a map entry.
+	// It must be the first element?
+	struct bpf_timer timer;
+
 	struct bpf_cpumask __kptr *cpumask;
 	/* To avoid allocation on the reconfiguration path, have a second cpumask we
 	   can just do an xchg on. */
@@ -334,18 +343,127 @@ static void cstat_inc(enum cell_stat_idx idx, u32 cell, struct cpu_ctx *cctx)
 	cstat_add(idx, cell, cctx, 1);
 }
 
+struct cpumask_wrapper {
+	struct bpf_cpumask __kptr *cpumask;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, u32);
+	__type(value, struct cpumask_wrapper);
+	__uint(max_entries, MAX_L3S);
+	__uint(map_flags, 0);
+} l3_cpumasks SEC(".maps");
+
+// Use the cell cpumask wrapper to avoid realloc.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, u32);
+	__type(value, struct cell_cpumask_wrapper);
+	__uint(max_entries, MAX_CELLS);
+	__uint(map_flags, 0);
+} cell_throttle_masks SEC(".maps");
+
+static struct cell_cpumask_wrapper *lookup_throttle_mask(u32 cell_id)
+{
+	struct cpumask_wrapper *cpumask;
+
+	if (!(cpumask = bpf_map_lookup_elem(&cell_throttle_masks, &cell_id))) {
+		scx_bpf_error("no cell cpumask");
+		return NULL;
+	}
+
+	return cpumask;
+}
+
+static int update_throttle_mask(u32 cell_id)
+{
+	struct cell *cell;
+	struct cpumask_wrapper *l3_mask;
+	struct bpf_cpumask *new_mask;
+	struct cell_cpumask_wrapper *throttle_mask;
+
+	if (!(throttle_mask =
+		      bpf_map_lookup_elem(&cell_throttle_masks, &cell_id))) {
+		scx_bpf_error("no cell cpumask");
+		return -1;
+	}
+
+	if (!(cell = lookup_cell(cell_id))) {
+		scx_bpf_error("no cell for cpumask");
+		return 0;
+	}
+
+	new_mask = bpf_kptr_xchg(&throttle_mask->tmp_cpumask, NULL);
+	if (!new_mask) {
+		scx_bpf_error("no newmask");
+		return -1;
+	}
+	bpf_cpumask_clear(new_mask);
+
+	int rval = 0;
+	int i;
+
+	bpf_for(i, 0, MAX_L3S)
+	{
+		if (cell->l3_runtime_ns[i] &&
+		    cell->l3_used_ns > cell->l3_runtime_ns) {
+			if (!(l3_mask =
+				      bpf_map_lookup_elem(&l3_cpumasks, &i))) {
+				scx_bpf_error("failed to lookup throttled l3");
+				rval = -1;
+				bpf_cpumask_release(new_mask);
+				goto out;
+			}
+			if (!l3_mask->cpumask) {
+				scx_bpf_error("no l3 mask");
+				rval = -1;
+				bpf_cpumask_release(new_mask);
+				goto out;
+			}
+			bpf_cpumask_or(new_mask, (struct cpumask *)new_mask,
+				       (struct cpumask *)l3_mask->cpumask);
+		}
+	}
+
+	new_mask = bpf_kptr_xchg(&throttle_mask->cpumask, new_mask);
+	if (!new_mask) {
+		scx_bpf_error("new_mask should never be null");
+		return -ENOENT;
+	}
+
+	new_mask = bpf_kptr_xchg(&throttle_mask->tmp_cpumask, new_mask);
+	if (new_mask) {
+		scx_bpf_error("new_mask should be null");
+		bpf_cpumask_release(new_mask);
+		return -EINVAL;
+	}
+
+out:
+	return rval;
+}
+
 static inline int update_task_cpumask(struct task_struct *p,
 				      struct task_ctx *tctx)
 {
 	const struct cpumask *cell_cpumask;
+	struct cell_cpumask_wrapper *throttle_mask;
 
 	if (!(cell_cpumask = lookup_cell_cpumask(tctx->cell)))
 		return -ENOENT;
 
-	if (!tctx->cpumask)
-		return -EINVAL;
+	// Reuse tmp_cpumask from the throttle mask here to avoid
+	// allocation.
+	if (!(throttle_mask = lookup_throttle_mask(tctx->cell)))
+		return -ENOENT;
 
-	bpf_cpumask_and(tctx->cpumask, cell_cpumask, p->cpus_ptr);
+	if (!throttle_mask->tmp_cpumask || !throttle_mask->cpumask)
+		return -EINVAL;
+	bpf_cpumask_xor(throttle_mask->tmp_cpumask, throttle_mask->cpumask,
+			cell_cpumask);
+	if (!tctx->cpumask || !throttle_mask->tmp_cpumask)
+		return -EINVAL;
+	bpf_cpumask_and(tctx->cpumask, throttle_mask->tmp_cpumask, p->cpus_ptr);
 	return 0;
 }
 
@@ -463,6 +581,69 @@ out:
 	return cpu;
 }
 
+static __always_inline u32 cpu_to_l3_id(s32 cpu_id)
+{
+	const volatile u32 *l3_ptr;
+
+	l3_ptr = MEMBER_VPTR(cpu_to_l3_id_map, [cpu_id]);
+	if (!l3_ptr) {
+		scx_bpf_error("Couldn't look up L3 ID for cpu %d", cpu_id);
+		return 0;
+	}
+	return *l3_ptr;
+}
+
+static bool cell_can_run_on_l3(struct cell *cell, u32 l3_id)
+{
+	u64 now;
+	u64 l3_used_ns;
+	u64 l3_delta_ns;
+
+	u64 l3_runtime_ns = cell->l3_runtime_ns[l3_id];
+
+	// we have no limitations on this l3
+	if (l3_runtime_ns == 0)
+		return true;
+
+	now = scx_bpf_now();
+	l3_used_ns = cell->l3_used_ns[l3_id];
+	l3_delta_ns = now - cell->l3_start_ns[l3_id];
+
+	// first, check if we've gone past the period. if we have, reset the
+	// timer.
+	if (l3_delta_ns > l3_throttle_period_ns) {
+		cell->l3_start_ns[l3_id] = now;
+		cell->l3_used_ns[l3_id] = 0;
+		return true;
+	}
+
+	// if we have not used all runtime, we can run
+	if (l3_used_ns < l3_runtime_ns)
+		return true;
+
+	// can't run!
+	return false;
+}
+
+static bool cell_can_run(u32 cell_id, u32 cpu_id)
+{
+	struct cell *cell;
+	u32 l3_id;
+
+	// don't throttle root
+	if (cell_id == 0)
+		return true;
+
+	if (!(cell = lookup_cell(cell_id)))
+		return true;
+
+	l3_id = cpu_to_l3_id(cpu_id);
+	if (l3_id >= MAX_L3S)
+		return true;
+
+	return cell_can_run_on_l3(cell, l3_id);
+}
+
 /*
  * select_cpu is where we update each task's cell assignment and then try to
  * dispatch to an idle core in the cell if possible
@@ -576,7 +757,7 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 
 	if (p->flags & PF_KTHREAD && p->nr_cpus_allowed == 1) {
 		scx_bpf_dsq_insert(p, HI_FALLBACK_DSQ, slice_ns, 0);
-	} else if (!tctx->all_cpus_allowed) {
+	} else if (tctx->all_cpus_allowed) {
 		// FIXME: With cpusets, most schedules will fall into this section and
 		// not actually get distributed to the correct cell. We need to loosen
 		// the check on tctx->all_cpus_allowed
@@ -607,6 +788,24 @@ void BPF_STRUCT_OPS(mitosis_dispatch, s32 cpu, struct task_struct *prev)
 	prev_cell = READ_ONCE(cctx->prev_cell);
 	cell = READ_ONCE(cctx->cell);
 
+	// rudimentary antistall
+	struct task_struct *p;
+	struct cell *c;
+	struct task_ctx *tctx;
+	bpf_for_each(scx_dsq, p, c->dsq, 0)
+	{
+		if (!(tctx = lookup_task_ctx(p)))
+			continue;
+		u64 now = scx_bpf_now();
+		u64 delay = (now - tctx->started_running_at) / CONFIG_HZ;
+		// These are vtime dsqs, so this would be the first element
+		// anyway?
+		if (delay > 20) {
+			scx_bpf_dsq_move_to_local(c->dsq);
+			return;
+		}
+	}
+
 	if (scx_bpf_dsq_move_to_local(HI_FALLBACK_DSQ))
 		return;
 
@@ -618,7 +817,8 @@ void BPF_STRUCT_OPS(mitosis_dispatch, s32 cpu, struct task_struct *prev)
 	if (prev_cell != cell && scx_bpf_dsq_move_to_local(prev_cell))
 		return;
 
-	if (scx_bpf_dsq_move_to_local(cell))
+	// Check to see if we've exhausted this cells runtime
+	if (cell_can_run(cell, cpu) && scx_bpf_dsq_move_to_local(cell))
 		return;
 
 	scx_bpf_dsq_move_to_local(LO_FALLBACK_DSQ);
@@ -718,14 +918,21 @@ void BPF_STRUCT_OPS(mitosis_running, struct task_struct *p)
 {
 	struct task_ctx *tctx;
 	struct cell *cell;
+	struct cpu_ctx *cctx;
+	u32 cpu = scx_bpf_task_cpu(p);
 
-	if (!(tctx = lookup_task_ctx(p)) || !(cell = lookup_cell(tctx->cell)))
+	if (!(tctx = lookup_task_ctx(p)) || !(cell = lookup_cell(tctx->cell)) ||
+	    !(cctx = lookup_cpu_ctx(cpu)))
 		return;
 
 	if (time_before(cell->vtime_now, p->scx.dsq_vtime))
 		cell->vtime_now = p->scx.dsq_vtime;
 
 	tctx->started_running_at = scx_bpf_now();
+	cctx->started_at = tctx->started_running_at;
+
+	if (!cell_can_run(tctx->cell, cpu))
+		scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);
 }
 
 void BPF_STRUCT_OPS(mitosis_stopping, struct task_struct *p, bool runnable)
@@ -735,9 +942,13 @@ void BPF_STRUCT_OPS(mitosis_stopping, struct task_struct *p, bool runnable)
 	struct cell *cell;
 	u64 now, used;
 	u32 cidx;
+	u32 l3_id;
+	s32 task_cpu;
 
 	if (!(cctx = lookup_cpu_ctx(-1)) || !(tctx = lookup_task_ctx(p)))
 		return;
+
+	cctx->started_at = 0;
 
 	cidx = tctx->cell;
 	if (!(cell = lookup_cell(cidx)))
@@ -748,6 +959,13 @@ void BPF_STRUCT_OPS(mitosis_stopping, struct task_struct *p, bool runnable)
 	tctx->started_running_at = now;
 	/* scale the execution time by the inverse of the weight and charge */
 	p->scx.dsq_vtime += used * 100 / p->scx.weight;
+
+	// throttle accounting
+	l3_id;
+	task_cpu = scx_bpf_task_cpu(p);
+	l3_id = cpu_to_l3_id(task_cpu);
+	if (l3_id < MAX_L3S)
+		cell->l3_used_ns[l3_id] += used;
 
 	if (cidx != 0 || tctx->all_cpus_allowed) {
 		u64 *cell_cycles = MEMBER_VPTR(cctx->cell_cycles, [cidx]);
@@ -1070,12 +1288,78 @@ s32 BPF_STRUCT_OPS(mitosis_init_task, struct task_struct *p,
 
 	return 0;
 }
+static int handle_throttling(void *map, int *key, struct bpf_timer *timer)
+{
+	u32 cell_idx;
+	u32 l3_idx;
+	u32 cpu;
+	const struct cpumask *cpumask;
+	struct cpu_ctx *cctx;
+
+	struct cell *cell;
+	bpf_for(cell_idx, 0, MAX_CELLS)
+	{
+		cell = &cells[cell_idx];
+		if (!cell->in_use)
+			continue;
+
+		bpf_rcu_read_lock();
+		if (update_throttle_mask(cell_idx) != 0) {
+			scx_bpf_error("throttle mask failed?");
+			bpf_rcu_read_unlock();
+			return 0;
+		}
+
+		bpf_for(l3_idx, 0, MAX_L3S)
+		{
+			if (!(cpumask = lookup_cell_cpumask(cell_idx)))
+				continue;
+
+			if (cell->l3_runtime_ns[l3_idx]) {
+				bpf_for(cpu, 0, nr_possible_cpus)
+				{
+					continue;
+					if (l3_idx == cpu_to_l3_id(cpu) &&
+					    bpf_cpumask_test_cpu(cpu,
+								 cpumask)) {
+						if (!(cctx = lookup_cpu_ctx(
+							      cpu)))
+							continue;
+						if (!cctx->started_at)
+							continue;
+
+						if (cell->l3_used_ns[l3_idx] +
+							    cctx->started_at +
+							    scx_bpf_now() >
+						    cell->l3_runtime_ns[l3_idx]) {
+							const char fmt[] =
+								"preempt!";
+							bpf_trace_printk(
+								fmt,
+								sizeof(fmt));
+							scx_bpf_kick_cpu(
+								cpu,
+								SCX_KICK_PREEMPT);
+						}
+					}
+				}
+			}
+		}
+		bpf_rcu_read_unlock();
+	}
+
+	bpf_timer_start(timer, slice_ns, 0);
+	return 0;
+}
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(mitosis_init)
 {
 	struct bpf_cpumask *cpumask;
 	u32 i;
 	s32 ret;
+	u32 cpu;
+	struct cell_cpumask_wrapper *w;
+	u32 zero = 0;
 
 	ret = scx_bpf_create_dsq(HI_FALLBACK_DSQ, -1);
 	if (ret < 0)
@@ -1101,6 +1385,24 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mitosis_init)
 		} else {
 			return -EINVAL;
 		}
+	}
+
+	// Initialize an aggressive reconfiguration timer to handle throttling.
+	// Use the root cell mask to hold the timer, since it's always going to
+	// be available.
+	if (!(w = bpf_map_lookup_elem(&cell_cpumasks, &zero))) {
+		scx_bpf_error("Failed to find root cell cpumask");
+		bpf_cpumask_release(cpumask);
+		return -ENOENT;
+	}
+
+	bpf_timer_init(&w->timer, &cell_cpumasks, CLOCK_MONOTONIC);
+	bpf_timer_set_callback(&w->timer, handle_throttling);
+	ret = bpf_timer_start(&w->timer, slice_ns, 0);
+	if (ret) {
+		scx_bpf_error("Failed to start timer on 0: %d", ret);
+		bpf_cpumask_release(cpumask);
+		return -ENOENT;
 	}
 
 	cpumask = bpf_kptr_xchg(&all_cpumask, cpumask);
@@ -1146,9 +1448,58 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(mitosis_init)
 			bpf_cpumask_release(cpumask);
 			return -EINVAL;
 		}
+
+		// Prepare a throttle mask for every cell. Use these to quickly
+		// exclude throttled cpus from the candidate set during select.
+		struct cell_cpumask_wrapper *throttle_maskw;
+		if (!(throttle_maskw =
+			      bpf_map_lookup_elem(&cell_throttle_masks, &i)))
+			return -ENOENT;
+		cpumask = bpf_cpumask_create();
+		if (!cpumask)
+			return -ENOMEM;
+		cpumask = bpf_kptr_xchg(&throttle_maskw->cpumask, cpumask);
+		if (cpumask) {
+			bpf_cpumask_release(cpumask);
+			return -EINVAL;
+		}
+
+		cpumask = bpf_cpumask_create();
+		if (!cpumask)
+			return -ENOMEM;
+		cpumask = bpf_kptr_xchg(&throttle_maskw->tmp_cpumask, cpumask);
+		if (cpumask) {
+			/* Should be impossible, we just initialized the cell tmp_cpumask */
+			bpf_cpumask_release(cpumask);
+			return -EINVAL;
+		}
 	}
 
 	cells[0].in_use = true;
+
+	// Finally map the cpus in llcs to masks that we can use later to
+	// quicly build throttle masks. These will never change.
+	bpf_for(i, 0, MAX_L3S)
+	{
+		struct cpumask_wrapper *l3_mask_wrapper;
+		if (!(l3_mask_wrapper = bpf_map_lookup_elem(&l3_cpumasks, &i)))
+			return -ENOENT;
+
+		cpumask = bpf_cpumask_create();
+		if (!cpumask)
+			return -ENOMEM;
+
+		bpf_for(cpu, 0, nr_possible_cpus)
+		{
+			u32 cpu_l3 = cpu_to_l3_id(cpu);
+			if (cpu_l3 == i)
+				bpf_cpumask_set_cpu(cpu, cpumask);
+		}
+
+		cpumask = bpf_kptr_xchg(&l3_mask_wrapper->cpumask, cpumask);
+		if (cpumask)
+			bpf_cpumask_release(cpumask);
+	}
 
 	return 0;
 }
