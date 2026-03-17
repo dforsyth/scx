@@ -12,6 +12,10 @@ typedef unsigned int	   u32;
 typedef _Bool bool;
 #endif
 
+enum mitosis_exit_code {
+	MITOSIS_EXIT_INCOMPATIBLE = 1,
+};
+
 enum consts {
 	CACHELINE_SIZE	      = 64,
 	MAX_CPUS_SHIFT	      = 9,

@@ -45,6 +45,7 @@ const volatile bool	     debug_events_enabled	     = false;
 const volatile bool	     exiting_task_workaround_enabled = true;
 const volatile bool	     cpu_controller_disabled	     = false;
 const volatile bool	     reject_multicpu_pinning	     = false;
+const volatile bool	     exit_on_incompatible	     = false;
 const volatile bool	     userspace_managed_cell_mode     = false;
 const volatile bool	     enable_borrowing		     = false;
 
@@ -429,8 +430,13 @@ static inline int update_task_cpumask(struct task_struct *p,
 	if (tctx->cell != 0 && reject_multicpu_pinning &&
 	    !tctx->all_cell_cpus_allowed &&
 	    bpf_cpumask_weight(p->cpus_ptr) > 1) {
-		scx_bpf_error("multi-CPU pinning within cell %d not supported",
-			      tctx->cell);
+		if (exit_on_incompatible)
+			scx_bpf_exit(MITOSIS_EXIT_INCOMPATIBLE,
+				     "multi-CPU pinning within cell %d not supported",
+				     tctx->cell);
+		else
+			scx_bpf_error("multi-CPU pinning within cell %d not supported",
+				      tctx->cell);
 		return -EINVAL;
 	}
 

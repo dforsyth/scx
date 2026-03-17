@@ -55,6 +55,20 @@ use stats::CellMetrics;
 use stats::Metrics;
 
 const SCHEDULER_NAME: &str = "scx_mitosis";
+
+/// scx_mitosis process exit codes. Range 200+ to avoid collisions with
+/// standard codes (0-2), BSD sysexits (64-78), and signal exits (128+N).
+const EXIT_INCOMPATIBLE: i32 = 200;
+
+fn incompatible_exit_process_code(bpf_exit_code: Option<i64>) -> Option<i32> {
+    match bpf_exit_code {
+        Some(code) if code == bpf_intf::mitosis_exit_code_MITOSIS_EXIT_INCOMPATIBLE as i64 => {
+            Some(EXIT_INCOMPATIBLE)
+        }
+        _ => None,
+    }
+}
+
 const MAX_CELLS: usize = bpf_intf::consts_MAX_CELLS as usize;
 const NR_CSTATS: usize = bpf_intf::cell_stat_idx_NR_CSTATS as usize;
 
@@ -138,6 +152,12 @@ struct Opts {
     /// By default, these tasks are allowed but may have degraded performance.
     #[clap(long, action = clap::ArgAction::SetTrue)]
     reject_multicpu_pinning: bool,
+
+    /// Exit cleanly with EXIT_INCOMPATIBLE (200) instead of crashing when an
+    /// incompatible workload is detected (e.g. multi-CPU pinning rejection).
+    /// Requires --reject-multicpu-pinning.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    exit_on_incompatible: bool,
 
     /// Enable LLC-awareness. This will populate the scheduler's LLC maps and cause it
     /// to use LLC-aware scheduling.
@@ -331,6 +351,7 @@ impl<'a> Scheduler<'a> {
         }
 
         rodata.reject_multicpu_pinning = opts.reject_multicpu_pinning;
+        rodata.exit_on_incompatible = opts.exit_on_incompatible;
 
         // Set nr_llc in rodata
         rodata.nr_llc = nr_llc as u32;
@@ -1364,10 +1385,41 @@ fn main(opts: Opts) -> Result<()> {
     let mut open_object = MaybeUninit::uninit();
     loop {
         let mut sched = Scheduler::init(&opts, &mut open_object)?;
-        if !sched.run(shutdown.clone())?.should_restart() {
+        let uei = sched.run(shutdown.clone())?;
+        if let Some(code) = incompatible_exit_process_code(uei.exit_code()) {
+            std::process::exit(code);
+        }
+        if !uei.should_restart() {
             break;
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_incompatible_exit_returns_dataerr() {
+        assert_eq!(
+            incompatible_exit_process_code(Some(
+                bpf_intf::mitosis_exit_code_MITOSIS_EXIT_INCOMPATIBLE as i64
+            )),
+            Some(EXIT_INCOMPATIBLE),
+        );
+    }
+
+    #[test]
+    fn test_other_exit_codes_return_none() {
+        assert_eq!(incompatible_exit_process_code(Some(0)), None);
+        assert_eq!(incompatible_exit_process_code(Some(42)), None);
+        assert_eq!(incompatible_exit_process_code(Some(-1)), None);
+    }
+
+    #[test]
+    fn test_no_exit_code_returns_none() {
+        assert_eq!(incompatible_exit_process_code(None), None);
+    }
 }
