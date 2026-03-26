@@ -28,7 +28,6 @@
 
 #include "mitosis.bpf.h"
 #include "dsq.bpf.h"
-#include "llc_aware.bpf.h"
 
 char _license[] SEC("license") = "GPL";
 
@@ -47,6 +46,13 @@ const volatile bool	     cpu_controller_disabled	     = false;
 const volatile bool	     reject_multicpu_pinning	     = false;
 const volatile bool	     userspace_managed_cell_mode     = false;
 const volatile bool	     enable_borrowing		     = false;
+
+/*
+ * vtime.bpf.h needs slice_ns and mitosis.bpf.h types.
+ * llc_aware.bpf.h needs vtime.bpf.h for vt_task_set.
+ */
+#include "vtime.bpf.h"
+#include "llc_aware.bpf.h"
 
 /*
  * Global arrays for LLC topology, populated by userspace before load.
@@ -232,7 +238,7 @@ static inline int allocate_cell()
 			return -1;
 
 		if (__sync_bool_compare_and_swap(&c->in_use, 0, 1)) {
-			zero_cell_vtimes(c);
+			zero_cell_vtimes(c, cell_idx, VT_CELL_ALLOC);
 			return cell_idx;
 		}
 	}
@@ -455,7 +461,13 @@ static inline int update_task_cpumask(struct task_struct *p,
 		if (dsq_is_invalid(tctx->dsq))
 			return -EINVAL;
 
-		p->scx.dsq_vtime = READ_ONCE(cpu_ctx->vtime_now);
+		if (enable_vtime_ledger) {
+			vt_task_set(p, tctx,
+				    READ_ONCE(cpu_ctx->vtime_now),
+				    VT_CPUMASK_UPDATE);
+		} else {
+			p->scx.dsq_vtime = READ_ONCE(cpu_ctx->vtime_now);
+		}
 		return 0;
 	}
 
@@ -474,7 +486,14 @@ static inline int update_task_cpumask(struct task_struct *p,
 	if (!(cell = lookup_cell(tctx->cell)))
 		return -ENOENT;
 
-	p->scx.dsq_vtime = READ_ONCE(cell->llcs[FAKE_FLAT_CELL_LLC].vtime_now);
+	if (enable_vtime_ledger) {
+		vt_task_set(p, tctx,
+			    READ_ONCE(cell->llcs[FAKE_FLAT_CELL_LLC].vtime_now),
+			    VT_CPUMASK_UPDATE);
+	} else {
+		p->scx.dsq_vtime =
+			READ_ONCE(cell->llcs[FAKE_FLAT_CELL_LLC].vtime_now);
+	}
 
 	return 0;
 }
@@ -820,10 +839,14 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 	 * Limit the amount of budget that an idling task can accumulate
 	 * to one slice.
 	 */
-	if (time_before(vtime, basis_vtime - slice_ns))
-		vtime = basis_vtime - slice_ns;
-
-	scx_bpf_dsq_insert_vtime(p, tctx->dsq.raw, slice_ns, vtime, enq_flags);
+	if (enable_vtime_ledger) {
+		vt_enqueue(p, tctx, vtime, enq_flags, VT_IDLE_BUDGET_CLAMP);
+	} else {
+		if (time_before(vtime, basis_vtime - slice_ns))
+			vtime = basis_vtime - slice_ns;
+		scx_bpf_dsq_insert_vtime(p, tctx->dsq.raw, slice_ns, vtime,
+					 enq_flags);
+	}
 
 	/* Kick the CPU if needed */
 	if (!__COMPAT_is_enq_cpu_selected(enq_flags) && cpu >= 0)
@@ -1311,14 +1334,22 @@ static int update_timer_cb(void *map, int *key, struct bpf_timer *timer)
 }
 
 static inline void advance_cell_llc_vtime(struct cell	  *cell,
-					  struct task_ctx *tctx, u64 task_vtime)
+					  struct task_ctx *tctx,
+					  u64 task_vtime,
+					  enum vt_reason reason)
 {
 	u32 llc_idx = enable_llc_awareness && llc_is_valid(tctx->llc) ?
 			      tctx->llc :
 			      FAKE_FLAT_CELL_LLC;
 
-	if (time_before(READ_ONCE(cell->llcs[llc_idx].vtime_now), task_vtime))
-		WRITE_ONCE(cell->llcs[llc_idx].vtime_now, task_vtime);
+	if (enable_vtime_ledger) {
+		vt_cell_llc_try_advance(cell, tctx->cell, llc_idx,
+					task_vtime, reason);
+	} else {
+		if (time_before(READ_ONCE(cell->llcs[llc_idx].vtime_now),
+				task_vtime))
+			WRITE_ONCE(cell->llcs[llc_idx].vtime_now, task_vtime);
+	}
 }
 
 void BPF_STRUCT_OPS(mitosis_running, struct task_struct *p)
@@ -1362,11 +1393,15 @@ void BPF_STRUCT_OPS(mitosis_stopping, struct task_struct *p, bool runnable)
 	used			 = now - tctx->started_running_at;
 	tctx->started_running_at = now;
 	/* scale the execution time by the inverse of the weight and charge */
-	if (p->scx.weight == 0) {
-		scx_bpf_error("Task %d has zero weight", p->pid);
-		return;
+	if (enable_vtime_ledger) {
+		vt_task_charge(p, tctx, used, VT_TASK_STOPPING);
+	} else {
+		if (p->scx.weight == 0) {
+			scx_bpf_error("Task %d has zero weight", p->pid);
+			return;
+		}
+		p->scx.dsq_vtime += used * 100 / p->scx.weight;
 	}
-	p->scx.dsq_vtime += used * 100 / p->scx.weight;
 
 	/*
 	 * Advance this CPU's per-CPU DSQ vtime, UNLESS the task was
@@ -1379,8 +1414,15 @@ void BPF_STRUCT_OPS(mitosis_stopping, struct task_struct *p, bool runnable)
 	 * advancing cctx->vtime_now is correct and prevents staleness.
 	 */
 	if (!tctx->borrowed) {
-		if (time_before(READ_ONCE(cctx->vtime_now), p->scx.dsq_vtime))
-			WRITE_ONCE(cctx->vtime_now, p->scx.dsq_vtime);
+		if (enable_vtime_ledger) {
+			vt_cpu_try_advance(cctx, p->scx.dsq_vtime,
+					   VT_TASK_STOPPING);
+		} else {
+			if (time_before(READ_ONCE(cctx->vtime_now),
+					p->scx.dsq_vtime))
+				WRITE_ONCE(cctx->vtime_now,
+					   p->scx.dsq_vtime);
+		}
 	}
 
 	/* Clear the borrowed flag — it is one-shot, consumed above */
@@ -1394,7 +1436,8 @@ void BPF_STRUCT_OPS(mitosis_stopping, struct task_struct *p, bool runnable)
 	} else {
 		vtime_cell = cell;
 	}
-	advance_cell_llc_vtime(vtime_cell, tctx, p->scx.dsq_vtime);
+	advance_cell_llc_vtime(vtime_cell, tctx, p->scx.dsq_vtime,
+			       VT_TASK_STOPPING);
 
 	{
 		u64 *running = MEMBER_VPTR(cctx->running_ns, [tctx->cell]);
@@ -1886,6 +1929,36 @@ void BPF_STRUCT_OPS(mitosis_dump, struct scx_dump_ctx *dctx)
 			break;
 		}
 	}
+
+	if (!enable_vtime_recording)
+		return;
+
+	scx_bpf_dump("\nVTIME LEDGER (last %d):\n", vtime_ledger_size);
+
+	u32 vt_total = READ_ONCE(vtime_ledger_pos);
+	u32 vt_start = vt_total > vtime_ledger_size ?
+			       vt_total - vtime_ledger_size :
+			       0;
+
+	bpf_for(i, 0, vtime_ledger_size)
+	{
+		u32 ev_num = vt_start + i;
+		if (ev_num >= vt_total)
+			break;
+
+		u32		    idx = ev_num % vtime_ledger_size;
+		struct vtime_event *ev =
+			bpf_map_lookup_elem(&vtime_ledger, &idx);
+		if (!ev)
+			continue;
+
+		scx_bpf_dump(
+			"[%5d] domain=%u reason=%u pid=%u cpu=%u cell=%u llc=%d "
+			"old=%llu new=%llu weight=%u ts=%llu\n",
+			ev_num, ev->domain, ev->reason, ev->pid, ev->cpu,
+			ev->cell, ev->llc, ev->old_vtime, ev->new_vtime,
+			ev->weight, ev->timestamp);
+	}
 }
 
 void BPF_STRUCT_OPS(mitosis_dump_task, struct scx_dump_ctx *dctx,
@@ -2283,14 +2356,19 @@ int apply_cell_config(void *ctx)
 									cctx->llc) ?
 							cctx->llc :
 							FAKE_FLAT_CELL_LLC;
-					if (time_before(
-						    READ_ONCE(
-							    cell->llcs[llc_idx]
-								    .vtime_now),
-						    cctx->vtime_now))
-						WRITE_ONCE(cell->llcs[llc_idx]
-								   .vtime_now,
-							   cctx->vtime_now);
+					if (enable_vtime_ledger) {
+						vt_cell_llc_try_advance(
+							cell, cell_id,
+							llc_idx,
+							cctx->vtime_now,
+							VT_CONFIG_APPLY);
+					} else {
+						if (time_before(
+							    READ_ONCE(cell->llcs[llc_idx].vtime_now),
+							    cctx->vtime_now))
+							WRITE_ONCE(cell->llcs[llc_idx].vtime_now,
+								   cctx->vtime_now);
+					}
 				}
 				cctx->cell = cell_id;
 			}

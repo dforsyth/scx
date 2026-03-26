@@ -188,16 +188,21 @@ static inline s32 pick_llc_for_task(u32 cell_id)
 	return ret;
 }
 
-static void zero_cell_vtimes(struct cell *cell)
+static void zero_cell_vtimes(struct cell *cell, u32 cell_idx,
+			     enum vt_reason reason)
 {
-	if (enable_llc_awareness) {
-		u32 llc_idx;
-		bpf_for(llc_idx, 0, MAX_LLCS)
-		{
-			WRITE_ONCE(cell->llcs[llc_idx].vtime_now, 0);
-		}
+	if (enable_vtime_ledger) {
+		vt_cell_zero(cell, cell_idx, reason);
 	} else {
-		WRITE_ONCE(cell->llcs[FAKE_FLAT_CELL_LLC].vtime_now, 0);
+		if (enable_llc_awareness) {
+			u32 llc_idx;
+			bpf_for(llc_idx, 0, MAX_LLCS)
+			{
+				WRITE_ONCE(cell->llcs[llc_idx].vtime_now, 0);
+			}
+		} else {
+			WRITE_ONCE(cell->llcs[FAKE_FLAT_CELL_LLC].vtime_now, 0);
+		}
 	}
 }
 
@@ -344,6 +349,12 @@ static inline int update_task_llc_assignment(struct task_struct *p,
 	if (!cell)
 		return -ENOENT;
 
-	p->scx.dsq_vtime = READ_ONCE(cell->llcs[new_llc].vtime_now);
+	if (enable_vtime_ledger) {
+		vt_task_set(p, tctx,
+			    READ_ONCE(cell->llcs[new_llc].vtime_now),
+			    VT_LLC_REASSIGNMENT);
+	} else {
+		p->scx.dsq_vtime = READ_ONCE(cell->llcs[new_llc].vtime_now);
+	}
 	return 0;
 }

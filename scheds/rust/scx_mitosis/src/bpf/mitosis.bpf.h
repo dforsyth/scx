@@ -64,6 +64,15 @@ struct task_ctx {
 	struct bpf_cpumask __kptr *cpumask;
 	/* started_running_at for recording runtime */
 	u64 started_running_at;
+	/*
+	 * Current DSQ vtime watermark, sampled at enqueue from the
+	 * task's target DSQ (cell-LLC or per-CPU). Used to clamp how
+	 * far behind an idle task's vtime can fall: without this, a
+	 * long-sleeping task would wake with a very old vtime and
+	 * starve other tasks by consuming unlimited priority. The
+	 * clamp limits accumulated idle budget to one slice behind
+	 * the watermark.
+	 */
 	u64 basis_vtime;
 	/* For the sake of monitoring, each task is owned by a cell */
 	u32 cell;

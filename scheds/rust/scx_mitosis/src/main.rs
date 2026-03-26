@@ -71,6 +71,26 @@ fn parse_ewma_factor(s: &str) -> Result<f64, String> {
     Ok(v)
 }
 
+fn parse_vtime_events(s: &str) -> Result<u64> {
+    if s == "all" {
+        return Ok((1u64 << bpf_intf::vt_reason_NR_VT_REASONS) - 1);
+    }
+    let mut mask = 0u64;
+    for name in s.split(',') {
+        let reason = match name.trim() {
+            "task-stopping" => bpf_intf::vt_reason_VT_TASK_STOPPING,
+            "cpumask-update" => bpf_intf::vt_reason_VT_CPUMASK_UPDATE,
+            "llc-reassignment" => bpf_intf::vt_reason_VT_LLC_REASSIGNMENT,
+            "idle-budget-clamp" => bpf_intf::vt_reason_VT_IDLE_BUDGET_CLAMP,
+            "cell-alloc" => bpf_intf::vt_reason_VT_CELL_ALLOC,
+            "config-apply" => bpf_intf::vt_reason_VT_CONFIG_APPLY,
+            other => bail!("unknown vtime event type: {}", other),
+        };
+        mask |= 1u64 << reason;
+    }
+    Ok(mask)
+}
+
 /// scx_mitosis: A dynamic affinity scheduler
 ///
 /// Cgroups are assigned to a dynamic number of Cells which are assigned to a
@@ -165,6 +185,25 @@ struct Opts {
     /// Only meaningful with --cell-parent-cgroup and multiple cells.
     #[clap(long, action = clap::ArgAction::SetTrue)]
     enable_borrowing: bool,
+
+    /// Use vt_* functions for all vtime mutations (enables structured tracking).
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    enable_vtime_ledger: bool,
+
+    /// Record vtime mutations to a circular buffer for post-mortem analysis.
+    /// Requires --enable-vtime-ledger.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    enable_vtime_recording: bool,
+
+    /// Size of the vtime ledger circular buffer (number of entries).
+    #[clap(long, default_value = "8192")]
+    vtime_ledger_size: u32,
+
+    /// Comma-separated list of vtime event types to record, or "all".
+    /// Types: task-stopping, cpumask-update, llc-reassignment,
+    ///        idle-budget-clamp, cell-alloc, config-apply
+    #[clap(long, default_value = "all")]
+    vtime_ledger_events: String,
 
     /// Enable demand-based CPU rebalancing between cells.
     #[clap(long, action = clap::ArgAction::SetTrue)]
@@ -341,6 +380,11 @@ impl<'a> Scheduler<'a> {
 
         rodata.enable_borrowing = opts.enable_borrowing;
 
+        rodata.enable_vtime_ledger = opts.enable_vtime_ledger;
+        rodata.enable_vtime_recording = opts.enable_vtime_recording;
+        rodata.vtime_ledger_size = opts.vtime_ledger_size;
+        rodata.vtime_ledger_event_mask = parse_vtime_events(&opts.vtime_ledger_events)?;
+
         match *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP {
             0 => info!("Kernel does not support queued wakeup optimization."),
             v => skel.struct_ops.mitosis_mut().flags |= v,
@@ -357,6 +401,12 @@ impl<'a> Scheduler<'a> {
             mitosis_topology_utils::MapKind::LLCToCpus,
             None,
         )?;
+
+        if opts.enable_vtime_recording {
+            skel.maps
+                .vtime_ledger
+                .set_max_entries(opts.vtime_ledger_size)?;
+        }
 
         let skel = scx_ops_load!(skel, mitosis, uei)?;
 

@@ -9,6 +9,7 @@
 #include <stddef.h>
 typedef unsigned long long u64;
 typedef unsigned int	   u32;
+typedef int		   s32;
 typedef _Bool bool;
 #endif
 
@@ -26,6 +27,8 @@ enum consts {
 	MAX_LLCS	      = 16,
 
 	DEBUG_EVENTS_BUF_SIZE = 4096,
+
+	VTIME_LEDGER_DEFAULT_SIZE = 8192,
 
 	/* Size of cpumask in unsigned longs (supports up to 8192 CPUs) */
 	CPUMASK_LONG_ENTRIES = 128,
@@ -170,6 +173,37 @@ struct cell_assignment {
 /* Cell cpumask data for a single cell */
 struct cell_cpumask_data {
 	unsigned char mask[MAX_CPUS_U8];
+};
+
+/* Vtime ledger domain — which field was mutated */
+enum vt_domain {
+	VT_DOMAIN_TASK,		/* p->scx.dsq_vtime */
+	VT_DOMAIN_CPU,		/* cctx->vtime_now */
+	VT_DOMAIN_CELL_LLC,	/* cell->llcs[llc].vtime_now */
+};
+
+/* Vtime ledger reason — code context that triggered the mutation */
+enum vt_reason {
+	VT_TASK_STOPPING,	/* stopping(): task charged / watermarks updated */
+	VT_CPUMASK_UPDATE,	/* update_task_cpumask(): pin or cell move */
+	VT_LLC_REASSIGNMENT,	/* update_task_llc_assignment(): LLC changed */
+	VT_IDLE_BUDGET_CLAMP,	/* enqueue(): idle task budget clamped */
+	VT_CELL_ALLOC,		/* allocate_cell(): new cell, vtimes zeroed */
+	VT_CONFIG_APPLY,	/* apply_cell_config(): vtime propagated */
+	NR_VT_REASONS,
+};
+
+struct vtime_event {
+	u64 timestamp;
+	u64 old_vtime;
+	u64 new_vtime;
+	u32 domain;		/* enum vt_domain — which field changed */
+	u32 reason;		/* enum vt_reason — why it changed */
+	u32 pid;		/* 0 for non-task events */
+	u32 cpu;
+	u32 cell;
+	s32 llc;		/* -1 when N/A */
+	u32 weight;		/* 0 for non-task events */
 };
 
 /*
