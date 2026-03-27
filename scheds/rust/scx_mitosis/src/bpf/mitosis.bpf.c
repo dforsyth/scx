@@ -524,9 +524,10 @@ static inline int update_task_routing(struct task_struct *p,
 	return 0;
 }
 
-/* Figure out the task's cell and refresh its routing state. */
-static inline int update_task_cell(struct task_struct *p, struct task_ctx *tctx,
-				   struct cgroup *cg)
+/* Resolve the task's current cgroup ownership into a live cell id. */
+static inline int resolve_task_cell(struct task_struct *p,
+				    struct task_ctx *tctx, struct cgroup *cg,
+				    u32 *cell, u64 *cgid)
 {
 	struct cgrp_ctx *cgc;
 
@@ -560,8 +561,23 @@ static inline int update_task_cell(struct task_struct *p, struct task_ctx *tctx,
 		}
 	}
 
-	tctx->cell = cgc->cell;
-	tctx->cgid = cg->kn->id;
+	*cell = cgc->cell;
+	*cgid = cg->kn->id;
+	return 0;
+}
+
+/* Figure out the task's cell and refresh its routing state. */
+static inline int update_task_cell(struct task_struct *p, struct task_ctx *tctx,
+				   struct cgroup *cg)
+{
+	u32 cell;
+	u64 cgid;
+
+	if (resolve_task_cell(p, tctx, cg, &cell, &cgid))
+		return -ENOENT;
+
+	tctx->cell = cell;
+	tctx->cgid = cgid;
 
 	/* Task ownership changed, so rebuild its DSQ routing from live cell state. */
 	return update_task_routing(p, tctx);
@@ -612,8 +628,26 @@ static s32 pick_idle_cpu_from(struct task_struct   *p,
 static __always_inline int maybe_refresh_cell(struct task_struct *p,
 					      struct task_ctx	 *tctx)
 {
-	if (userspace_managed_cell_mode)
-		return refresh_task_cell(p, tctx);
+	if (userspace_managed_cell_mode) {
+		struct cgroup *cgrp __free(cgroup) = task_cgroup(p);
+		u32		    cell;
+		u64		    cgid;
+
+		if (!cgrp)
+			return -1;
+
+		/* In userspace-managed mode, check the live cgroup cell before rerouting. */
+		if (resolve_task_cell(p, tctx, cgrp, &cell, &cgid))
+			return -1;
+
+		if (cell != tctx->cell || cgid != tctx->cgid) {
+			tctx->cell = cell;
+			tctx->cgid = cgid;
+			return update_task_routing(p, tctx);
+		}
+
+		return 0;
+	}
 
 	/*
 	 * When not using CPU controller, check if task's cgroup changed.
