@@ -373,6 +373,63 @@ static inline const struct cpumask *lookup_cell_borrowable_cpumask(int idx)
 	return (const struct cpumask *)cpumaskw->borrowable_cpumask;
 }
 
+/* Determine whether the task can use the cell-wide shared DSQ path. */
+static __always_inline bool
+task_can_use_shared_cell_domain(struct task_struct *p, u32 cell_id)
+{
+	const struct cpumask *cell_cpumask;
+
+	cell_cpumask = lookup_cell_cpumask(cell_id);
+	if (!cell_cpumask)
+		return false;
+
+	if (!bpf_cpumask_subset(cell_cpumask, p->cpus_ptr))
+		return false;
+
+	if (enable_borrowing) {
+		const struct cpumask *borrowable_cpumask;
+
+		borrowable_cpumask = lookup_cell_borrowable_cpumask(cell_id);
+		if (!borrowable_cpumask)
+			return false;
+
+		if (!bpf_cpumask_subset(borrowable_cpumask, p->cpus_ptr))
+			return false;
+	}
+
+	return true;
+}
+
+/* Build the task's current primary eligibility mask from cell ownership. */
+static __always_inline int task_primary_mask(struct task_struct *p,
+					     struct task_ctx	*tctx,
+					     struct bpf_cpumask *dst)
+{
+	const struct cpumask *cell_cpumask;
+
+	cell_cpumask = lookup_cell_cpumask(tctx->cell);
+	if (!cell_cpumask)
+		return -ENOENT;
+
+	bpf_cpumask_and(dst, cell_cpumask, p->cpus_ptr);
+	return 0;
+}
+
+/* Build the task's current borrowable eligibility mask from cell borrowing state. */
+static __always_inline int task_borrowable_mask(struct task_struct *p,
+						struct task_ctx	   *tctx,
+						struct bpf_cpumask *dst)
+{
+	const struct cpumask *borrowable_cpumask;
+
+	borrowable_cpumask = lookup_cell_borrowable_cpumask(tctx->cell);
+	if (!borrowable_cpumask)
+		return -ENOENT;
+
+	bpf_cpumask_and(dst, borrowable_cpumask, p->cpus_ptr);
+	return 0;
+}
+
 /*
  * Helper functions for bumping per-cell stats
  */
@@ -406,19 +463,8 @@ static inline int update_task_cpumask(struct task_struct *p,
 		return -EINVAL;
 
 	bpf_cpumask_and(tctx->cpumask, cell_cpumask, p->cpus_ptr);
-
-	if (cell_cpumask)
-		tctx->all_cell_cpus_allowed =
-			bpf_cpumask_subset(cell_cpumask, p->cpus_ptr);
-
-	if (tctx->all_cell_cpus_allowed && enable_borrowing) {
-		const struct cpumask *borrowable =
-			lookup_cell_borrowable_cpumask(tctx->cell);
-		if (!borrowable)
-			return -ENOENT;
-		if (!bpf_cpumask_subset(borrowable, p->cpus_ptr))
-			tctx->all_cell_cpus_allowed = false;
-	}
+	tctx->all_cell_cpus_allowed =
+		task_can_use_shared_cell_domain(p, tctx->cell);
 
 	/*
 	* Single-CPU pinning is fine (even if outside this cell).
@@ -604,10 +650,16 @@ static __always_inline s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
 					 struct cpu_ctx	 *cctx,
 					 struct task_ctx *tctx)
 {
-	struct cpumask *task_cpumask;
+	struct bpf_cpumask *task_cpumask __free(bpf_cpumask) =
+		bpf_cpumask_create();
 
-	if (!(task_cpumask = (struct cpumask *)tctx->cpumask)) {
-		scx_bpf_error("Failed to get task cpumask");
+	if (!task_cpumask) {
+		scx_bpf_error("Failed to allocate task primary cpumask");
+		return -1;
+	}
+
+	if (task_primary_mask(p, tctx, task_cpumask)) {
+		scx_bpf_error("Failed to derive task primary cpumask");
 		return -1;
 	}
 
@@ -619,13 +671,14 @@ static __always_inline s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
 	}
 
 	/* No overlap between cell cpus and task cpus, just find some idle cpu */
-	if (bpf_cpumask_empty(task_cpumask)) {
+	if (bpf_cpumask_empty((const struct cpumask *)task_cpumask)) {
 		cstat_inc(CSTAT_AFFN_VIOL, tctx->cell, cctx);
 		return pick_idle_cpu_from(p, p->cpus_ptr, prev_cpu,
 					  idle_smtmask);
 	}
 
-	return pick_idle_cpu_from(p, task_cpumask, prev_cpu, idle_smtmask);
+	return pick_idle_cpu_from(p, (const struct cpumask *)task_cpumask,
+				  prev_cpu, idle_smtmask);
 }
 
 /*
@@ -665,17 +718,26 @@ static __always_inline s32 try_pick_idle_cpu(struct task_struct *p,
 
 	/* cpu == -EBUSY: no idle CPU in cell, try borrowing */
 	if (enable_borrowing) {
-		const struct cpumask *borrowable =
-			lookup_cell_borrowable_cpumask(tctx->cell);
-		if (!borrowable)
+		struct bpf_cpumask *borrowable __free(bpf_cpumask) =
+			bpf_cpumask_create();
+		if (!borrowable) {
+			scx_bpf_error(
+				"Failed to allocate task borrowable cpumask");
 			return -1;
+		}
+		if (task_borrowable_mask(p, tctx, borrowable)) {
+			scx_bpf_error(
+				"Failed to derive task borrowable cpumask");
+			return -1;
+		}
 		const struct cpumask *idle_smtmask __free(idle_cpumask) =
 			scx_bpf_get_idle_smtmask();
 		if (!idle_smtmask) {
 			scx_bpf_error("Failed to get idle smtmask");
 			return -1;
 		}
-		cpu = pick_idle_cpu_from(p, borrowable, prev_cpu, idle_smtmask);
+		cpu = pick_idle_cpu_from(p, (const struct cpumask *)borrowable,
+					 prev_cpu, idle_smtmask);
 		if (cpu >= 0) {
 			tctx->borrowed = true;
 			cstat_inc(CSTAT_BORROWED, tctx->cell, cctx);
@@ -697,9 +759,12 @@ static __always_inline s32 try_pick_idle_cpu(struct task_struct *p,
 s32 BPF_STRUCT_OPS(mitosis_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
-	s32		 cpu;
-	struct cpu_ctx	*cctx;
-	struct task_ctx *tctx;
+	s32				  cpu;
+	struct cpu_ctx			 *cctx;
+	struct task_ctx			 *tctx;
+	struct bpf_cpumask *fallback_mask __free(bpf_cpumask) =
+		bpf_cpumask_create();
+	bool shared_cell_domain;
 
 	if (!(cctx = lookup_cpu_ctx(-1)) || !(tctx = lookup_task_ctx(p)))
 		return prev_cpu;
@@ -707,7 +772,10 @@ s32 BPF_STRUCT_OPS(mitosis_select_cpu, struct task_struct *p, s32 prev_cpu,
 	if (maybe_refresh_cell(p, tctx) < 0)
 		return prev_cpu;
 
-	if (!tctx->all_cell_cpus_allowed) {
+	/* Recheck against the live cell masks in case userspace just reconfigured. */
+	shared_cell_domain = task_can_use_shared_cell_domain(p, tctx->cell);
+
+	if (!shared_cell_domain) {
 		cstat_inc(CSTAT_AFFN_VIOL, tctx->cell, cctx);
 		cpu = get_cpu_from_dsq(tctx->dsq);
 		if (cpu < 0)
@@ -721,17 +789,21 @@ s32 BPF_STRUCT_OPS(mitosis_select_cpu, struct task_struct *p, s32 prev_cpu,
 	if ((cpu = try_pick_idle_cpu(p, prev_cpu, cctx, tctx, false)) >= 0)
 		return cpu;
 
-	if (!tctx->cpumask) {
-		scx_bpf_error("tctx->cpumask should never be NULL");
+	if (!fallback_mask) {
+		scx_bpf_error("Failed to allocate task fallback cpumask");
 		return prev_cpu;
 	}
+	if (task_primary_mask(p, tctx, fallback_mask))
+		return prev_cpu;
+
 	/*
 	 * All else failed, send it to the prev cpu (if that's valid), otherwise any
 	 * valid cpu.
 	 */
-	if (!bpf_cpumask_test_cpu(prev_cpu, cast_mask(tctx->cpumask)) &&
-	    tctx->cpumask)
-		cpu = bpf_cpumask_any_distribute(cast_mask(tctx->cpumask));
+	if (!bpf_cpumask_test_cpu(prev_cpu,
+				  (const struct cpumask *)fallback_mask))
+		cpu = bpf_cpumask_any_distribute(
+			(const struct cpumask *)fallback_mask);
 	else
 		cpu = prev_cpu;
 
@@ -747,6 +819,7 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 	u64		 vtime;
 	s32		 cpu = -1;
 	u64		 basis_vtime;
+	bool		 shared_cell_domain;
 
 	if (!(tctx = lookup_task_ctx(p)) || !(cctx = lookup_cpu_ctx(-1)))
 		return;
@@ -757,7 +830,10 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 	/* Ensure this is done *AFTER* refreshing cell which might manipulate vtime */
 	vtime = p->scx.dsq_vtime;
 
-	if (!tctx->all_cell_cpus_allowed) {
+	/* Recheck against the live cell masks before choosing the queueing path. */
+	shared_cell_domain = task_can_use_shared_cell_domain(p, tctx->cell);
+
+	if (!shared_cell_domain) {
 		cpu = get_cpu_from_dsq(tctx->dsq);
 		if (cpu < 0)
 			return;
@@ -774,18 +850,21 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 		if (cpu == -1)
 			return;
 		if (cpu == -EBUSY) {
-			/*
-			 * Verifier gets unhappy claiming two different pointer types for
-			 * the same instruction here. This fixes it
-			 */
-			barrier_var(tctx);
-			if (tctx->cpumask)
-				cpu = bpf_cpumask_any_distribute(
-					(const struct cpumask *)tctx->cpumask);
+			struct bpf_cpumask *fallback_mask __free(bpf_cpumask) =
+				bpf_cpumask_create();
+			if (!fallback_mask) {
+				scx_bpf_error(
+					"Failed to allocate enqueue fallback cpumask");
+				return;
+			}
+			if (task_primary_mask(p, tctx, fallback_mask))
+				return;
+			cpu = bpf_cpumask_any_distribute(
+				(const struct cpumask *)fallback_mask);
 		}
 	}
 
-	if (tctx->all_cell_cpus_allowed) {
+	if (shared_cell_domain) {
 		cstat_inc(CSTAT_CELL_DSQ, tctx->cell, cctx);
 		/* Task can use any CPU in its cell, so use the cell DSQ */
 		if (!(cell = lookup_cell(tctx->cell)))
@@ -2171,40 +2250,46 @@ void BPF_STRUCT_OPS(mitosis_exit, struct scx_exit_info *ei)
  * Configuration data is read from the cell_config global struct,
  * which is populated by userspace before invoking this program.
  *
- * The function operates in five phases:
- * 1. Mark all cells (except cell 0) as not in use
- * 2. Apply cell assignments for owner cgroups
- * 3. Walk cgroup hierarchy to propagate cells to children
- * 4. Apply cell cpumasks and CPU-to-cell mappings
- * 5. Bump applied_configuration_seq to signal completion
+ * The function operates in ordered phases:
+ * 1. Clear old non-root cell ownership
+ * 2. Publish primary cell cpumasks and CPU ownership
+ * 3. Publish borrowable cell cpumasks
+ * 4. Recompute LLC counts for active cells
+ * 5. Bind owner cgroups to configured cells
+ * 6. Propagate inherited cell ownership
+ * 7. Bump applied_configuration_seq to signal completion
  *
  * Note: This is not atomic - tasks may observe intermediate states during
  * execution. On error, the scheduler may be left in a partially-configured
  * state. This is acceptable because userspace treats errors as fatal and
  * exits, causing the scheduler to be unloaded.
  */
-SEC("syscall")
-int apply_cell_config(void *ctx)
+/* Read one CPU bit out of a userspace-populated cell cpumask blob. */
+static __always_inline bool
+config_cpumask_test_cpu(const struct cell_cpumask_data *cpumask_data, u32 cpu,
+			int *err)
 {
-	struct cgrp_ctx		    *cgc;
-	struct cell		    *cell;
-	struct cpu_ctx		    *cctx;
-	struct cell_cpumask_wrapper *cpumaskw;
-	struct cgroup_subsys_state  *root_css, *pos;
-	struct cgroup		    *cur_cgrp;
-	u32			     i, cell_id;
+	u32		     byte_idx = cpu / 8;
+	const unsigned char *bytep =
+		MEMBER_VPTR(cpumask_data->mask, [byte_idx]);
 
-	/* Read configuration from global struct (populated by userspace) */
-	struct cell_config *config = &cell_config;
+	if (!bytep) {
+		scx_bpf_error("byte_idx %d out of bounds", byte_idx);
+		*err = -EINVAL;
+		return false;
+	}
 
-	/*
-	 * Phase 1: Mark all cells (except cell 0) as not in use.
-	 * This handles cell destruction - cells not in the new config
-	 * will remain marked as not in use.
-	 */
+	return *bytep & (1 << (cpu % 8));
+}
+
+/* Clear owner state for all non-root cells before applying a new config. */
+static __always_inline int reset_non_root_cells_for_config(void)
+{
+	u32 i;
+
 	bpf_for(i, 1, MAX_CELLS)
 	{
-		cell = lookup_cell(i);
+		struct cell *cell = lookup_cell(i);
 		if (!cell)
 			return -EINVAL;
 
@@ -2212,241 +2297,178 @@ int apply_cell_config(void *ctx)
 		cell->owner_cgid = 0;
 	}
 
-	/*
-	 * Phase 2: Apply cell cpumasks and derive CPU-to-cell mappings.
-	 * For each cell, we update the cell's cpumask and set each CPU's
-	 * cell assignment based on which cell's cpumask contains it.
-	 *
-	 * This is done before cgroup assignments so that any task
-	 * initialized mid-operation that reads a new cell ID will find
-	 * correct cpumasks already in place.
-	 */
-	if (config->num_cells > MAX_CELLS)
+	return 0;
+}
+
+/* Publish a cell's primary cpumask and update per-CPU cell ownership. */
+static __always_inline int
+publish_primary_cell_state(u32				   cell_id,
+			   const struct cell_cpumask_data *cpumask_data)
+{
+	struct cell		       *cell;
+	struct cpu_ctx		       *cctx;
+	struct cell_cpumask_wrapper    *cpumaskw;
+	struct bpf_cpumask *new_cpumask __free(bpf_cpumask) = NULL;
+	int				err		    = 0;
+	u32				cpu;
+
+	cpumaskw = bpf_map_lookup_elem(&cell_cpumasks, &cell_id);
+	if (!cpumaskw)
+		return 0;
+
+	new_cpumask = bpf_kptr_xchg(&cpumaskw->tmp_cpumask, NULL);
+	if (!new_cpumask) {
+		scx_bpf_error("tmp_cpumask is NULL for cell %d", cell_id);
 		return -EINVAL;
-
-	bpf_for(cell_id, 0, MAX_CELLS)
-	{
-		struct cell_cpumask_data *cpumask_data;
-
-		if (cell_id >= config->num_cells)
-			break;
-
-		cpumaskw = bpf_map_lookup_elem(&cell_cpumasks, &cell_id);
-		if (!cpumaskw)
-			continue;
-
-		cpumask_data = MEMBER_VPTR(config->cpumasks, [cell_id]);
-		if (!cpumask_data) {
-			scx_bpf_error("cell_id %d out of bounds", cell_id);
-			return -EINVAL;
-		}
-
-		/* Get the tmp_cpumask to build the new mask */
-		struct bpf_cpumask *new_cpumask __free(bpf_cpumask) =
-			bpf_kptr_xchg(&cpumaskw->tmp_cpumask, NULL);
-		if (!new_cpumask) {
-			scx_bpf_error("tmp_cpumask is NULL for cell %d",
-				      cell_id);
-			return -EINVAL;
-		}
-
-		/* Clear the cpumask and set bits based on the config data */
-		bpf_cpumask_clear(new_cpumask);
-
-		/* Set cpumask bits and CPU-to-cell mappings */
-		u32 cpu;
-		bpf_for(cpu, 0, nr_possible_cpus)
-		{
-			u32		     byte_idx = cpu / 8;
-			u32		     bit_idx  = cpu % 8;
-
-			const unsigned char *bytep =
-				MEMBER_VPTR(cpumask_data->mask, [byte_idx]);
-			if (!bytep) {
-				scx_bpf_error("byte_idx %d out of bounds",
-					      byte_idx);
-				return -EINVAL;
-			}
-
-			if (*bytep & (1 << bit_idx)) {
-				bpf_cpumask_set_cpu(cpu, new_cpumask);
-				cctx = bpf_map_lookup_percpu_elem(
-					&cpu_ctxs, &(u32){ 0 }, cpu);
-				if (!cctx)
-					return -ENOENT;
-				/*
-				 * If the CPU is changing cells, advance the
-				 * new cell's vtime to at least match this
-				 * CPU's per-CPU vtime. Otherwise the per-CPU
-				 * DSQ and cell DSQ are in different vtime
-				 * domains and dispatch will starve the
-				 * per-CPU DSQ tasks.
-				 */
-				if (cctx->cell != cell_id) {
-					cell = lookup_cell(cell_id);
-					if (!cell)
-						return -ENOENT;
-					u32 llc_idx =
-						enable_llc_awareness &&
-								llc_is_valid(
-									cctx->llc) ?
-							cctx->llc :
-							FAKE_FLAT_CELL_LLC;
-					if (time_before(
-						    READ_ONCE(
-							    cell->llcs[llc_idx]
-								    .vtime_now),
-						    cctx->vtime_now))
-						WRITE_ONCE(cell->llcs[llc_idx]
-								   .vtime_now,
-							   cctx->vtime_now);
-				}
-				cctx->cell = cell_id;
-			}
-		}
-
-		/* Swap the new cpumask into place */
-		new_cpumask = bpf_kptr_xchg(&cpumaskw->cpumask,
-					    no_free_ptr(new_cpumask));
-		if (!new_cpumask) {
-			scx_bpf_error("cpumask should never be null");
-			return -EINVAL;
-		}
-
-		/* Put the old cpumask into tmp_cpumask for reuse */
-		struct bpf_cpumask *stale __free(bpf_cpumask) = bpf_kptr_xchg(
-			&cpumaskw->tmp_cpumask, no_free_ptr(new_cpumask));
-		if (stale) {
-			scx_bpf_error("tmp_cpumask should be null");
-			return -EINVAL;
-		}
-
-		/* Apply borrowable cpumask for this cell */
-		if (enable_borrowing) {
-			struct cell_cpumask_data *borrowable_data;
-
-			borrowable_data = MEMBER_VPTR(
-				config->borrowable_cpumasks, [cell_id]);
-			if (!borrowable_data) {
-				scx_bpf_error(
-					"cell_id %d out of bounds for borrowable",
-					cell_id);
-				return -EINVAL;
-			}
-
-			struct bpf_cpumask *bmask __free(bpf_cpumask) =
-				bpf_kptr_xchg(&cpumaskw->borrowable_tmp_cpumask,
-					      NULL);
-			if (!bmask) {
-				scx_bpf_error(
-					"borrowable_tmp_cpumask is NULL for cell %d",
-					cell_id);
-				return -EINVAL;
-			}
-
-			bpf_cpumask_clear(bmask);
-
-			u32 bcpu;
-			bpf_for(bcpu, 0, nr_possible_cpus)
-			{
-				u32		     byte_idx = bcpu / 8;
-				u32		     bit_idx  = bcpu % 8;
-
-				const unsigned char *bytep    = MEMBER_VPTR(
-					   borrowable_data->mask, [byte_idx]);
-				if (!bytep) {
-					scx_bpf_error(
-						"byte_idx %d out of bounds",
-						byte_idx);
-					return -EINVAL;
-				}
-
-				if (*bytep & (1 << bit_idx))
-					bpf_cpumask_set_cpu(bcpu, bmask);
-			}
-
-			bmask = bpf_kptr_xchg(&cpumaskw->borrowable_cpumask,
-					      no_free_ptr(bmask));
-			if (!bmask) {
-				scx_bpf_error(
-					"borrowable cpumask should never be null");
-				return -EINVAL;
-			}
-
-			struct bpf_cpumask *bstale __free(bpf_cpumask) =
-				bpf_kptr_xchg(&cpumaskw->borrowable_tmp_cpumask,
-					      no_free_ptr(bmask));
-			if (bstale) {
-				scx_bpf_error(
-					"borrowable tmp_cpumask should be null");
-				return -EINVAL;
-			}
-		}
 	}
 
-	/* Phase 2.5: Recompute per-LLC CPU counts for all cells */
-	if (enable_llc_awareness) {
-		u32 c;
-		scoped_guard(rcu)
-		{
-			bpf_for(c, 0, MAX_CELLS)
-			{
-				if (c >= config->num_cells)
-					break;
-				if (recalc_cell_llc_counts(c, NULL))
-					return -EINVAL;
-			}
-		}
-	}
+	bpf_cpumask_clear(new_cpumask);
 
-	/* Phase 3: Apply cell-to-cgroup assignments for owner cgroups */
-	if (config->num_cell_assignments > MAX_CELLS)
-		return -EINVAL;
-
-	bpf_for(i, 0, MAX_CELLS)
+	bpf_for(cpu, 0, nr_possible_cpus)
 	{
-		struct cell_assignment *assignment;
-
-		if (i >= config->num_cell_assignments)
-			break;
-
-		assignment = &config->assignments[i];
-
-		u64 cgid   = assignment->cgid;
-		cell_id	   = assignment->cell_id;
-
-		if (cell_id >= MAX_CELLS)
-			return -EINVAL;
-
-		struct cgroup *cg __free(cgroup) = bpf_cgroup_from_id(cgid);
-		if (!cg)
-			/*
-			 * The cgroup may have been deleted between when
-			 * userspace populated the config and now. Skip it;
-			 * userspace will discover the deletion via inotify
-			 * and remove it from the next config.
-			 */
+		if (err)
+			return err;
+		if (!config_cpumask_test_cpu(cpumask_data, cpu, &err)) {
+			if (err)
+				return err;
 			continue;
+		}
 
-		cgc = lookup_cgrp_ctx(cg);
-		if (!cgc)
+		bpf_cpumask_set_cpu(cpu, new_cpumask);
+		cctx = bpf_map_lookup_percpu_elem(&cpu_ctxs, &(u32){ 0 }, cpu);
+		if (!cctx)
 			return -ENOENT;
 
-		cell = lookup_cell(cell_id);
-		if (!cell)
-			return -EINVAL;
+		if (cctx->cell != cell_id) {
+			u32 llc_idx;
 
-		cell->in_use	 = 1;
-		cell->owner_cgid = cgid;
+			cell = lookup_cell(cell_id);
+			if (!cell)
+				return -ENOENT;
 
-		cgc->cell	 = cell_id;
-		cgc->cell_owner	 = true;
+			llc_idx = enable_llc_awareness &&
+						  llc_is_valid(cctx->llc) ?
+					  cctx->llc :
+					  FAKE_FLAT_CELL_LLC;
+
+			if (time_before(READ_ONCE(cell->llcs[llc_idx].vtime_now),
+					cctx->vtime_now))
+				WRITE_ONCE(cell->llcs[llc_idx].vtime_now,
+					   cctx->vtime_now);
+		}
+
+		cctx->cell = cell_id;
 	}
 
-	/*
-	 * Phase 4: Walk the cgroup hierarchy to propagate cell assignments
-	 * to children. Non-owner cgroups inherit their parent's cell.
-	 */
+	new_cpumask =
+		bpf_kptr_xchg(&cpumaskw->cpumask, no_free_ptr(new_cpumask));
+	if (!new_cpumask) {
+		scx_bpf_error("cpumask should never be null");
+		return -EINVAL;
+	}
+
+	struct bpf_cpumask *stale __free(bpf_cpumask) =
+		bpf_kptr_xchg(&cpumaskw->tmp_cpumask, no_free_ptr(new_cpumask));
+	if (stale) {
+		scx_bpf_error("tmp_cpumask should be null");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/* Publish a cell's borrowable cpumask used for cross-cell idle borrowing. */
+static __always_inline int
+publish_borrowable_cell_state(u32			      cell_id,
+			      const struct cell_cpumask_data *borrowable_data)
+{
+	struct cell_cpumask_wrapper *cpumaskw;
+	struct bpf_cpumask *bmask    __free(bpf_cpumask) = NULL;
+	int			     err		 = 0;
+	u32			     cpu;
+
+	cpumaskw = bpf_map_lookup_elem(&cell_cpumasks, &cell_id);
+	if (!cpumaskw)
+		return 0;
+
+	bmask = bpf_kptr_xchg(&cpumaskw->borrowable_tmp_cpumask, NULL);
+	if (!bmask) {
+		scx_bpf_error("borrowable_tmp_cpumask is NULL for cell %d",
+			      cell_id);
+		return -EINVAL;
+	}
+
+	bpf_cpumask_clear(bmask);
+
+	bpf_for(cpu, 0, nr_possible_cpus)
+	{
+		if (err)
+			return err;
+		if (!config_cpumask_test_cpu(borrowable_data, cpu, &err)) {
+			if (err)
+				return err;
+			continue;
+		}
+
+		bpf_cpumask_set_cpu(cpu, bmask);
+	}
+
+	bmask = bpf_kptr_xchg(&cpumaskw->borrowable_cpumask,
+			      no_free_ptr(bmask));
+	if (!bmask) {
+		scx_bpf_error("borrowable cpumask should never be null");
+		return -EINVAL;
+	}
+
+	struct bpf_cpumask *stale __free(bpf_cpumask) = bpf_kptr_xchg(
+		&cpumaskw->borrowable_tmp_cpumask, no_free_ptr(bmask));
+	if (stale) {
+		scx_bpf_error("borrowable tmp_cpumask should be null");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/* Bind one configured owner cgroup to its cell. */
+static __always_inline int
+apply_owner_assignment(const struct cell_assignment *assignment)
+{
+	struct cgroup *cg __free(cgroup) = NULL;
+	struct cgrp_ctx	 *cgc;
+	struct cell	 *cell;
+	u32		  cell_id = assignment->cell_id;
+	u64		  cgid	  = assignment->cgid;
+
+	if (cell_id >= MAX_CELLS)
+		return -EINVAL;
+
+	cg = bpf_cgroup_from_id(cgid);
+	if (!cg)
+		return 0;
+
+	cgc = lookup_cgrp_ctx(cg);
+	if (!cgc)
+		return -ENOENT;
+
+	cell = lookup_cell(cell_id);
+	if (!cell)
+		return -EINVAL;
+
+	cell->in_use	 = 1;
+	cell->owner_cgid = cgid;
+
+	cgc->cell	 = cell_id;
+	cgc->cell_owner	 = true;
+	return 0;
+}
+
+/* Walk the cgroup tree so non-owner cgroups inherit their parent's cell. */
+static __always_inline int propagate_inherited_cells_from_root(void)
+{
+	struct cgroup_subsys_state *root_css, *pos;
+	struct cgroup		   *cur_cgrp;
+
 	scoped_guard(rcu)
 	{
 		if (!root_cgrp) {
@@ -2461,31 +2483,22 @@ int apply_cell_config(void *ctx)
 				"Failed to acquire reference to root_cgrp");
 			return -EINVAL;
 		}
-		root_css = &root_cgrp_ref->self;
 
-		/* Initialize level_cells[0] to cell 0 (root cell) */
+		root_css       = &root_cgrp_ref->self;
 		level_cells[0] = 0;
 
-		/*
-		 * Walk all cgroups in pre-order traversal. For each cgroup:
-		 * - If it's a cell owner, record its cell in level_cells
-		 * - If not, inherit the parent's cell from level_cells[level-1]
-		 */
 		bpf_for_each(css, pos, root_css,
 			     BPF_CGROUP_ITER_DESCENDANTS_PRE) {
-			cur_cgrp = pos->cgroup;
-
-			/*
-			 * Look up cgrp_ctx for this cgroup. For dying cgroups
-			 * or those without storage, this may fail - that's OK
-			 * since they can't have tasks anyway.
-			 */
 			struct cgrp_ctx *cgrp_ctx;
+			struct cell	*cell;
+			u32		 level;
+
+			cur_cgrp = pos->cgroup;
 			cgrp_ctx = lookup_cgrp_ctx_fallible(cur_cgrp);
 			if (!cgrp_ctx)
 				continue;
 
-			u32 level = cur_cgrp->level;
+			level = cur_cgrp->level;
 			if (level >= MAX_CG_DEPTH) {
 				scx_bpf_error("Cgroup hierarchy too deep: %d",
 					      level);
@@ -2493,40 +2506,115 @@ int apply_cell_config(void *ctx)
 			}
 
 			if (cgrp_ctx->cell_owner) {
-				/*
-				 * Check if this cell is still in use and owned
-				 * by this cgroup. If not, this cgroup was a
-				 * former owner but is no longer in the new
-				 * config (or the cell ID was reused for a
-				 * different cgroup). Clear cell_owner and
-				 * inherit from parent.
-				 */
 				cell = lookup_cell(cgrp_ctx->cell);
 				if (!cell)
 					return -EINVAL;
+
 				if (cell->in_use &&
 				    cell->owner_cgid == cur_cgrp->kn->id) {
-					/* Cell owner with active cell - record in level_cells */
 					level_cells[level] = cgrp_ctx->cell;
 					continue;
 				}
-				/* Former owner, cell no longer in use - clear flag and fall through */
+
 				cgrp_ctx->cell_owner = false;
 			}
 
-			/* Not a cell owner (or was, but cell no longer active) - inherit from parent */
-			u32 parent_cell;
-			if (level > 0)
-				parent_cell = level_cells[level - 1];
-			else
-				parent_cell = 0;
-
+			u32 parent_cell = level > 0 ? level_cells[level - 1] :
+						      0;
 			WRITE_ONCE(cgrp_ctx->cell, parent_cell);
 			level_cells[level] = parent_cell;
 		}
 	}
 
-	/* Phase 5: Bump configuration sequence to make changes visible */
+	return 0;
+}
+
+SEC("syscall")
+int apply_cell_config(void *ctx)
+{
+	struct cell_config *config = &cell_config;
+	u32		    i, cell_id;
+	int		    ret;
+
+	ret = reset_non_root_cells_for_config();
+	if (ret)
+		return ret;
+
+	if (config->num_cells > MAX_CELLS)
+		return -EINVAL;
+
+	/* Phase 2: publish primary cpumasks and CPU ownership */
+	bpf_for(cell_id, 0, MAX_CELLS)
+	{
+		struct cell_cpumask_data *cpumask_data;
+
+		if (cell_id >= config->num_cells)
+			break;
+
+		cpumask_data = MEMBER_VPTR(config->cpumasks, [cell_id]);
+		if (!cpumask_data)
+			return -EINVAL;
+
+		ret = publish_primary_cell_state(cell_id, cpumask_data);
+		if (ret)
+			return ret;
+	}
+
+	/* Phase 3: publish borrowable cpumasks */
+	if (enable_borrowing) {
+		bpf_for(cell_id, 0, MAX_CELLS)
+		{
+			struct cell_cpumask_data *borrowable_data;
+
+			if (cell_id >= config->num_cells)
+				break;
+
+			borrowable_data = MEMBER_VPTR(
+				config->borrowable_cpumasks, [cell_id]);
+			if (!borrowable_data)
+				return -EINVAL;
+
+			ret = publish_borrowable_cell_state(cell_id,
+							    borrowable_data);
+			if (ret)
+				return ret;
+		}
+	}
+
+	/* Phase 4: recompute per-LLC CPU counts for all active cells */
+	if (enable_llc_awareness) {
+		scoped_guard(rcu)
+		{
+			bpf_for(cell_id, 0, MAX_CELLS)
+			{
+				if (cell_id >= config->num_cells)
+					break;
+				if (recalc_cell_llc_counts(cell_id, NULL))
+					return -EINVAL;
+			}
+		}
+	}
+
+	/* Phase 5: bind owner cgroups to their configured cells */
+	if (config->num_cell_assignments > MAX_CELLS)
+		return -EINVAL;
+
+	bpf_for(i, 0, MAX_CELLS)
+	{
+		if (i >= config->num_cell_assignments)
+			break;
+
+		ret = apply_owner_assignment(&config->assignments[i]);
+		if (ret)
+			return ret;
+	}
+
+	/* Phase 6: propagate inherited cell ownership through the tree */
+	ret = propagate_inherited_cells_from_root();
+	if (ret)
+		return ret;
+
+	/* Phase 7: publish the new configuration sequence */
 	__atomic_add_fetch(&applied_configuration_seq, 1, __ATOMIC_RELEASE);
 
 	return 0;
