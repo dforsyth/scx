@@ -784,6 +784,48 @@ static __always_inline s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu,
 				  prev_cpu, idle_smtmask);
 }
 
+/* Insert the task directly onto an idle CPU and optionally kick it. */
+static __always_inline s32 dispatch_to_idle_cpu(struct task_struct *p, s32 cpu,
+						bool kick)
+{
+	/*
+	 * Use SCX_DSQ_LOCAL_ON to target the specific idle CPU we picked.
+	 * From enqueue(), plain SCX_DSQ_LOCAL would resolve to task_rq(p)
+	 * instead of that idle CPU.
+	 */
+	scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, slice_ns, 0);
+	if (kick)
+		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+	return cpu;
+}
+
+/* Try to find an idle CPU from the task's borrowable mask. */
+static __always_inline s32 pick_idle_borrowed_cpu(struct task_struct *p,
+						  s32		      prev_cpu,
+						  struct task_ctx    *tctx)
+{
+	struct bpf_cpumask *borrowable __free(bpf_cpumask) =
+		bpf_cpumask_create();
+	const struct cpumask *idle_smtmask __free(idle_cpumask) =
+		scx_bpf_get_idle_smtmask();
+
+	if (!borrowable) {
+		scx_bpf_error("Failed to allocate task borrowable cpumask");
+		return -1;
+	}
+	if (task_borrowable_mask(p, tctx, borrowable)) {
+		scx_bpf_error("Failed to derive task borrowable cpumask");
+		return -1;
+	}
+	if (!idle_smtmask) {
+		scx_bpf_error("Failed to get idle smtmask");
+		return -1;
+	}
+
+	return pick_idle_cpu_from(p, (const struct cpumask *)borrowable,
+				  prev_cpu, idle_smtmask);
+}
+
 /*
  * Try to find an idle CPU for a task. First searches within the cell's
  * own CPUs, then tries borrowing from other cells if enabled.
@@ -803,52 +845,18 @@ static __always_inline s32 try_pick_idle_cpu(struct task_struct *p,
 	cpu = pick_idle_cpu(p, prev_cpu, cctx, tctx);
 	if (cpu >= 0) {
 		cstat_inc(CSTAT_LOCAL, tctx->cell, cctx);
-		/*
-		 * Use SCX_DSQ_LOCAL_ON to explicitly target the idle CPU
-		 * we found. In the select_cpu path this is redundant
-		 * (SCX_DSQ_LOCAL already resolves to the selected CPU),
-		 * but from the enqueue path (put_prev_task_scx ->
-		 * enqueue), SCX_DSQ_LOCAL resolves to task_rq(p) -- not
-		 * the idle CPU we picked.
-		 */
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, slice_ns, 0);
-		if (kick)
-			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-		return cpu;
+		return dispatch_to_idle_cpu(p, cpu, kick);
 	}
 	if (cpu == -1)
 		return -1; /* error from pick_idle_cpu, propagate */
 
 	/* cpu == -EBUSY: no idle CPU in cell, try borrowing */
 	if (enable_borrowing) {
-		struct bpf_cpumask *borrowable __free(bpf_cpumask) =
-			bpf_cpumask_create();
-		if (!borrowable) {
-			scx_bpf_error(
-				"Failed to allocate task borrowable cpumask");
-			return -1;
-		}
-		if (task_borrowable_mask(p, tctx, borrowable)) {
-			scx_bpf_error(
-				"Failed to derive task borrowable cpumask");
-			return -1;
-		}
-		const struct cpumask *idle_smtmask __free(idle_cpumask) =
-			scx_bpf_get_idle_smtmask();
-		if (!idle_smtmask) {
-			scx_bpf_error("Failed to get idle smtmask");
-			return -1;
-		}
-		cpu = pick_idle_cpu_from(p, (const struct cpumask *)borrowable,
-					 prev_cpu, idle_smtmask);
+		cpu = pick_idle_borrowed_cpu(p, prev_cpu, tctx);
 		if (cpu >= 0) {
 			tctx->borrowed = true;
 			cstat_inc(CSTAT_BORROWED, tctx->cell, cctx);
-			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON | cpu, slice_ns,
-					   0);
-			if (kick)
-				scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-			return cpu;
+			return dispatch_to_idle_cpu(p, cpu, kick);
 		}
 	}
 
