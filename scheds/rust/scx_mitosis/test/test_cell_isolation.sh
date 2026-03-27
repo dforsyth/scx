@@ -29,7 +29,8 @@ set -e
 
 # Configuration
 SCHEDULER_BIN="${SCHEDULER_BIN:-./target/release/scx_mitosis}"
-CGROUP_BASE="/sys/fs/cgroup/test.slice"
+CGROUP_BASE="/sys/fs/cgroup/scx_mitosis_test"
+CELL_PARENT_CGROUP="/scx_mitosis_test"
 LOG_FILE="/tmp/scx_mitosis_test.log"
 
 # Defaults
@@ -168,7 +169,7 @@ cleanup() {
         fi
     done
 
-    # Remove the parent test.slice cgroup
+    # Remove the parent test cgroup
     if [[ -d "$CGROUP_BASE" ]]; then
         # Kill any remaining processes
         for pid in $(cat "$CGROUP_BASE/cgroup.procs" 2>/dev/null); do
@@ -238,12 +239,83 @@ create_cgroups() {
     ls -la "$CGROUP_BASE" | grep test_cell
 }
 
+cleanup_test_cgroups_named() {
+    for cell_name in "$@"; do
+        local cell_path="$CGROUP_BASE/$cell_name"
+        if [[ -d "$cell_path" ]]; then
+            for pid in $(cat "$cell_path/cgroup.procs" 2>/dev/null); do
+                sudo kill -9 "$pid" 2>/dev/null || true
+            done
+            sudo rmdir "$cell_path" 2>/dev/null || true
+        fi
+    done
+}
+
+capture_monitor_output() {
+    local output_path="$1"
+    local attempt
+
+    for attempt in 1 2 3; do
+        : > "$output_path"
+        sudo timeout 4 "$SCHEDULER_BIN" --monitor 1 > "$output_path" 2>/dev/null || true
+        if grep -q "{" "$output_path" 2>/dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    return 1
+}
+
+configure_cpuset_parent() {
+    local root_cpus
+    local root_mems
+
+    if ! grep -q "cpuset" /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null; then
+        log_info "Enabling cpuset controller for /sys/fs/cgroup children"
+        echo "+cpuset" | sudo tee /sys/fs/cgroup/cgroup.subtree_control > /dev/null
+    fi
+
+    sudo mkdir -p "$CGROUP_BASE"
+
+    root_cpus=$(cat /sys/fs/cgroup/cpuset.cpus.effective)
+    root_mems=$(cat /sys/fs/cgroup/cpuset.mems.effective)
+
+    echo "$root_mems" | sudo tee "$CGROUP_BASE/cpuset.mems" > /dev/null
+    echo "$root_cpus" | sudo tee "$CGROUP_BASE/cpuset.cpus" > /dev/null
+
+    if ! grep -q "cpuset" "$CGROUP_BASE/cgroup.subtree_control" 2>/dev/null; then
+        log_info "Enabling cpuset controller for $CGROUP_BASE children"
+        echo "+cpuset" | sudo tee "$CGROUP_BASE/cgroup.subtree_control" > /dev/null
+    fi
+}
+
+configure_basic_cpuset_mode() {
+    local num_cpus
+    num_cpus=$(nproc)
+
+    if [[ "$num_cpus" -lt "$NUM_CELLS" ]]; then
+        log_error "Not enough CPUs for cpuset basic isolation test (need at least $NUM_CELLS)"
+        record_result "basic_isolation" "FAILED"
+        return 1
+    fi
+
+    configure_cpuset_parent
+
+    for i in $(seq 1 $NUM_CELLS); do
+        local cell_path="$CGROUP_BASE/test_cell_${i}"
+        local cpu=$((i - 1))
+        echo "0" | sudo tee "$cell_path/cpuset.mems" > /dev/null
+        echo "$cpu" | sudo tee "$cell_path/cpuset.cpus" > /dev/null
+    done
+}
+
 # Start the scheduler
 start_scheduler() {
     log_info "Starting scx_mitosis scheduler (mode: $MODE, extra flags: $@)..."
 
     sudo "$SCHEDULER_BIN" \
-        --cell-parent-cgroup /test.slice \
+        --cell-parent-cgroup "$CELL_PARENT_CGROUP" \
         "$@" \
         > "$LOG_FILE" 2>&1 &
     SCHED_PID=$!
@@ -409,6 +481,14 @@ record_result() {
 test_basic_isolation() {
     log_info "=== Running test: Basic CPU Isolation ==="
 
+    if [[ "$MODE" == "proportional" ]]; then
+        log_warn "Basic isolation requires cpuset-restricted cells; proportional mode does not guarantee CPU exclusivity"
+        record_result "basic_isolation" "INCONCLUSIVE"
+        return 0
+    fi
+
+    configure_basic_cpuset_mode || return 1
+
     start_workloads
     sample_cpu_assignments
 
@@ -416,7 +496,7 @@ test_basic_isolation() {
         record_result "basic_isolation" "PASSED"
         return 0
     else
-        record_result "basic_isolation" "INCONCLUSIVE"
+        record_result "basic_isolation" "FAILED"
         return 1
     fi
 }
@@ -584,65 +664,10 @@ test_cell_id_reuse() {
     fi
 }
 
-# Test: CPU borrowing - verify that a busy cell borrows CPUs from idle cells.
-# Args:
-#   $1 - stressor type: "pipe" (wakeup-heavy, select_cpu path) or
-#                        "cpu" (CPU spinners, enqueue path)
-#   $2 - test name for result recording
-test_borrowing() {
-    local stressor="$1"
-    local test_name="$2"
-    log_info "=== Running test: CPU Borrowing ($stressor stressor) ==="
+analyze_borrowing_monitor() {
+    local monitor_output="$1"
 
-    # Kill existing scheduler if running
-    if [[ -n "$SCHED_PID" ]] && ps -p "$SCHED_PID" > /dev/null 2>&1; then
-        sudo kill "$SCHED_PID" 2>/dev/null || true
-        sleep 2
-    fi
-    sudo pkill -9 scx_mitosis 2>/dev/null || true
-    sleep 2
-
-    # Create two test cells
-    local busy_path="$CGROUP_BASE/test_cell_borrow_busy"
-    local idle_path="$CGROUP_BASE/test_cell_borrow_idle"
-
-    for path in "$busy_path" "$idle_path"; do
-        if [[ -d "$path" ]]; then
-            for pid in $(cat "$path/cgroup.procs" 2>/dev/null); do
-                sudo kill -9 "$pid" 2>/dev/null || true
-            done
-            sudo rmdir "$path" 2>/dev/null || true
-        fi
-    done
-
-    sudo mkdir -p "$busy_path"
-    sudo mkdir -p "$idle_path"
-
-    # Start scheduler with borrowing
-    start_scheduler --enable-borrowing
-
-    # Use more workers than the busy cell has CPUs to force borrowing
-    local workers=$(nproc)
-
-    log_info "Starting $workers stress-ng $stressor workers in busy cell..."
-    sudo bash -c "echo \$\$ > $busy_path/cgroup.procs && \
-        exec stress-ng --$stressor $workers --timeout 60s --quiet" &
-
-    # Wait for stats to accumulate
-    sleep 5
-
-    # Capture monitor output
-    local monitor_output="/tmp/scx_mitosis_monitor_borrow.json"
-    log_info "Capturing monitor output..."
-    timeout 4 "$SCHEDULER_BIN" --monitor 1 > "$monitor_output" 2>/dev/null || true
-
-    # Kill workloads
-    sudo pkill -9 stress-ng 2>/dev/null || true
-    sleep 1
-
-    # Validate: check borrowing and usage tracking metrics from monitor JSON
-    local result
-    result=$(python3 -c "
+    python3 -c "
 import json, sys
 
 with open('$monitor_output', 'r') as f:
@@ -674,7 +699,6 @@ if borrowed_pct <= 0:
     print('FAIL:borrowed_pct is 0 (CSTAT_BORROWED not incremented)')
     sys.exit(0)
 
-# Find busy cell (highest util) and idle cell (lowest util)
 busy_id = max(cells, key=lambda c: cells[c].get('util_pct', 0))
 idle_id = min(cells, key=lambda c: cells[c].get('util_pct', 0))
 busy = cells[busy_id]
@@ -696,7 +720,72 @@ msg = 'PASS:borrowed=%.2f,busy=%s(util=%.1f,borrow=%.1f),idle=%s(lent=%.1f)' % (
     borrowed_pct, busy_id, busy['util_pct'], busy['demand_borrow_pct'],
     idle_id, idle['lent_pct'])
 print(msg)
-" 2>&1)
+"
+}
+
+# Test: CPU borrowing - verify that a busy cell borrows CPUs from idle cells.
+# Args:
+#   $1 - stressor type: "pipe" (wakeup-heavy, select_cpu path) or
+#                        "cpu" (CPU spinners, enqueue path)
+#   $2 - test name for result recording
+test_borrowing() {
+    local stressor="$1"
+    local test_name="$2"
+    log_info "=== Running test: CPU Borrowing ($stressor stressor) ==="
+
+    # Kill existing scheduler if running
+    if [[ -n "$SCHED_PID" ]] && ps -p "$SCHED_PID" > /dev/null 2>&1; then
+        sudo kill "$SCHED_PID" 2>/dev/null || true
+        sleep 2
+    fi
+    sudo pkill -9 scx_mitosis 2>/dev/null || true
+    sleep 2
+
+    # Create two test cells
+    local busy_path="$CGROUP_BASE/test_cell_borrow_busy"
+    local idle_path="$CGROUP_BASE/test_cell_borrow_idle"
+
+    cleanup_test_cgroups_named \
+        test_cell_1 test_cell_2 test_cell_3 test_cell_dynamic test_cell_temp \
+        test_cell_reuse_a test_cell_reuse_b test_cell_borrow_busy \
+        test_cell_borrow_idle test_cell_rebal_busy test_cell_rebal_idle \
+        test_cell_cpuset_a test_cell_cpuset_b test_cell_demand_a \
+        test_cell_demand_b test_cell_demand_c
+
+    sudo mkdir -p "$busy_path"
+    sudo mkdir -p "$idle_path"
+
+    # Start scheduler with borrowing
+    start_scheduler --enable-borrowing
+
+    # Use more workers than the busy cell has CPUs to force borrowing
+    local workers=$(nproc)
+
+    log_info "Starting $workers stress-ng $stressor workers in busy cell..."
+    sudo bash -c "echo \$\$ > $busy_path/cgroup.procs && \
+        exec stress-ng --$stressor $workers --timeout 60s --quiet" &
+
+    # Give the workload time to build enough pressure for borrowing metrics.
+    sleep 8
+
+    # Capture monitor output
+    local monitor_output="/tmp/scx_mitosis_monitor_borrow.json"
+    log_info "Capturing monitor output..."
+    capture_monitor_output "$monitor_output"
+
+    # Kill workloads
+    sudo pkill -9 stress-ng 2>/dev/null || true
+    sleep 1
+
+    # Validate: check borrowing and usage tracking metrics from monitor JSON.
+    local result
+    result=$(analyze_borrowing_monitor "$monitor_output" 2>&1)
+
+    if [[ "$result" == "NO_DATA" || "$result" == "FAIL:borrowed_pct is 0 (CSTAT_BORROWED not incremented)" ]]; then
+        sleep 2
+        capture_monitor_output "$monitor_output" || true
+        result=$(analyze_borrowing_monitor "$monitor_output" 2>&1)
+    fi
 
     log_info "Borrowing ($stressor) result: $result"
 
@@ -740,14 +829,12 @@ test_cpu_rebalancing_demand() {
     local busy_path="$CGROUP_BASE/test_cell_rebal_busy"
     local idle_path="$CGROUP_BASE/test_cell_rebal_idle"
 
-    for path in "$busy_path" "$idle_path"; do
-        if [[ -d "$path" ]]; then
-            for pid in $(cat "$path/cgroup.procs" 2>/dev/null); do
-                sudo kill -9 "$pid" 2>/dev/null || true
-            done
-            sudo rmdir "$path" 2>/dev/null || true
-        fi
-    done
+    cleanup_test_cgroups_named \
+        test_cell_1 test_cell_2 test_cell_3 test_cell_dynamic test_cell_temp \
+        test_cell_reuse_a test_cell_reuse_b test_cell_borrow_busy \
+        test_cell_borrow_idle test_cell_rebal_busy test_cell_rebal_idle \
+        test_cell_cpuset_a test_cell_cpuset_b test_cell_demand_a \
+        test_cell_demand_b test_cell_demand_c
 
     sudo mkdir -p "$busy_path"
     sudo mkdir -p "$idle_path"
@@ -755,7 +842,7 @@ test_cpu_rebalancing_demand() {
     # Start scheduler with borrowing and rebalancing enabled
     log_info "Starting scx_mitosis with --enable-borrowing --enable-rebalancing..."
     sudo "$SCHEDULER_BIN" \
-        --cell-parent-cgroup /test.slice \
+        --cell-parent-cgroup "$CELL_PARENT_CGROUP" \
         --enable-borrowing \
         --enable-rebalancing \
         --rebalance-cooldown-s 3 \
@@ -784,7 +871,7 @@ test_cpu_rebalancing_demand() {
     # Capture baseline CPU counts before workload (equal distribution)
     local baseline_output="/tmp/scx_mitosis_monitor_baseline.json"
     log_info "Capturing baseline CPU counts (before workload)..."
-    timeout 4 "$SCHEDULER_BIN" --monitor 1 > "$baseline_output" 2>/dev/null || true
+    capture_monitor_output "$baseline_output"
 
     # Start heavy workload only in busy cell
     local workers=$(nproc)
@@ -800,7 +887,7 @@ test_cpu_rebalancing_demand() {
     # Capture monitor output while workload is still running
     local monitor_output="/tmp/scx_mitosis_monitor_rebal.json"
     log_info "Capturing monitor output..."
-    timeout 4 "$SCHEDULER_BIN" --monitor 1 > "$monitor_output" 2>/dev/null || true
+    capture_monitor_output "$monitor_output"
 
     # Kill stress-ng workers
     sudo pkill -9 stress-ng 2>/dev/null || true
@@ -951,23 +1038,23 @@ test_cpuset_change() {
 
     # Clean up ALL test cgroups (not just cpuset ones) since earlier tests
     # may have left stale cgroups that would confuse the scheduler.
-    for cell_name in test_cell_1 test_cell_2 test_cell_3 test_cell_dynamic test_cell_temp test_cell_reuse_a test_cell_reuse_b test_cell_borrow_busy test_cell_borrow_idle test_cell_rebal_busy test_cell_rebal_idle test_cell_cpuset_a test_cell_cpuset_b; do
-        local path="$CGROUP_BASE/$cell_name"
-        if [[ -d "$path" ]]; then
-            for pid in $(cat "$path/cgroup.procs" 2>/dev/null); do
-                sudo kill -9 "$pid" 2>/dev/null || true
-            done
-            sudo rmdir "$path" 2>/dev/null || true
-        fi
-    done
+    cleanup_test_cgroups_named \
+        test_cell_1 test_cell_2 test_cell_3 test_cell_dynamic test_cell_temp \
+        test_cell_reuse_a test_cell_reuse_b test_cell_borrow_busy \
+        test_cell_borrow_idle test_cell_rebal_busy test_cell_rebal_idle \
+        test_cell_cpuset_a test_cell_cpuset_b test_cell_demand_a \
+        test_cell_demand_b test_cell_demand_c
+
+    sudo mkdir -p "$CGROUP_BASE"
+
+    if ! grep -q "cpu" "$CGROUP_BASE/cgroup.subtree_control" 2>/dev/null; then
+        echo "+cpu" | sudo tee "$CGROUP_BASE/cgroup.subtree_control" > /dev/null
+    fi
 
     sudo mkdir -p "$cell_a"
     sudo mkdir -p "$cell_b"
 
-    # Enable cpuset controller for children of test.slice
-    if ! grep -q "cpuset" "$CGROUP_BASE/cgroup.subtree_control" 2>/dev/null; then
-        echo "+cpuset" | sudo tee "$CGROUP_BASE/cgroup.subtree_control" > /dev/null
-    fi
+    configure_cpuset_parent
 
     # Get total CPU count and split into ranges, leaving some CPUs for cell 0
     local total_cpus=$(nproc)
@@ -984,6 +1071,8 @@ test_cpuset_change() {
 
     # Write initial cpusets: A gets first half, B gets second half
     log_info "Setting initial cpusets: A=$first_half, B=$second_half"
+    echo "0" | sudo tee "$cell_a/cpuset.mems" > /dev/null
+    echo "0" | sudo tee "$cell_b/cpuset.mems" > /dev/null
     echo "$first_half" | sudo tee "$cell_a/cpuset.cpus" > /dev/null
     echo "$second_half" | sudo tee "$cell_b/cpuset.cpus" > /dev/null
 
@@ -1099,25 +1188,12 @@ test_new_cell_gets_fair_share() {
     local idle_path="$CGROUP_BASE/test_cell_demand_b"
     local new_path="$CGROUP_BASE/test_cell_demand_c"
 
-    for path in "$busy_path" "$idle_path" "$new_path"; do
-        if [[ -d "$path" ]]; then
-            for pid in $(cat "$path/cgroup.procs" 2>/dev/null); do
-                sudo kill -9 "$pid" 2>/dev/null || true
-            done
-            sudo rmdir "$path" 2>/dev/null || true
-        fi
-    done
-
-    # Clean up other test cgroups that might interfere
-    for cell_name in test_cell_1 test_cell_2 test_cell_3 test_cell_dynamic test_cell_temp test_cell_reuse_a test_cell_reuse_b test_cell_borrow_busy test_cell_borrow_idle test_cell_rebal_busy test_cell_rebal_idle test_cell_cpuset_a test_cell_cpuset_b; do
-        local path="$CGROUP_BASE/$cell_name"
-        if [[ -d "$path" ]]; then
-            for pid in $(cat "$path/cgroup.procs" 2>/dev/null); do
-                sudo kill -9 "$pid" 2>/dev/null || true
-            done
-            sudo rmdir "$path" 2>/dev/null || true
-        fi
-    done
+    cleanup_test_cgroups_named \
+        test_cell_1 test_cell_2 test_cell_3 test_cell_dynamic test_cell_temp \
+        test_cell_reuse_a test_cell_reuse_b test_cell_borrow_busy \
+        test_cell_borrow_idle test_cell_rebal_busy test_cell_rebal_idle \
+        test_cell_cpuset_a test_cell_cpuset_b test_cell_demand_a \
+        test_cell_demand_b test_cell_demand_c
 
     sudo mkdir -p "$busy_path"
     sudo mkdir -p "$idle_path"
@@ -1125,7 +1201,7 @@ test_new_cell_gets_fair_share() {
     # Start scheduler with borrowing and rebalancing enabled
     log_info "Starting scx_mitosis with --enable-borrowing --enable-rebalancing..."
     sudo "$SCHEDULER_BIN" \
-        --cell-parent-cgroup /test.slice \
+        --cell-parent-cgroup "$CELL_PARENT_CGROUP" \
         --enable-borrowing \
         --enable-rebalancing \
         --rebalance-cooldown-s 3 \
@@ -1164,7 +1240,7 @@ test_new_cell_gets_fair_share() {
     # Capture pre-new-cell monitor snapshot showing rebalanced state
     local pre_snapshot="/tmp/scx_mitosis_monitor_pre_newcell.json"
     log_info "Capturing pre-new-cell monitor snapshot..."
-    timeout 4 "$SCHEDULER_BIN" --monitor 1 > "$pre_snapshot" 2>/dev/null || true
+    capture_monitor_output "$pre_snapshot"
 
     # Now create a third cell while workload is still running
     log_info "Creating new cell (C) while workload is running..."
@@ -1176,7 +1252,7 @@ test_new_cell_gets_fair_share() {
     # Capture post-new-cell monitor snapshot
     local post_snapshot="/tmp/scx_mitosis_monitor_post_newcell.json"
     log_info "Capturing post-new-cell monitor snapshot..."
-    timeout 4 "$SCHEDULER_BIN" --monitor 1 > "$post_snapshot" 2>/dev/null || true
+    capture_monitor_output "$post_snapshot"
 
     # Kill workloads
     sudo pkill -9 stress-ng 2>/dev/null || true
@@ -1310,9 +1386,9 @@ run_dynamic_tests() {
     log_info "Running Dynamic Cell Tests"
     log_info "======================================"
 
-    test_dynamic_cell_lifecycle
-    test_cpu_reallocation
-    test_cell_id_reuse
+    test_dynamic_cell_lifecycle || true
+    test_cpu_reallocation || true
+    test_cell_id_reuse || true
 }
 
 # Print test summary
@@ -1413,37 +1489,37 @@ main() {
 
     # Run basic isolation test
     if [[ $run_basic -eq 1 ]]; then
-        test_basic_isolation
+        test_basic_isolation || true
     fi
 
     # Run dynamic tests
     if [[ $run_dynamic -eq 1 ]]; then
-        run_dynamic_tests
+        run_dynamic_tests || true
     fi
 
     # Run borrowing test (pipe stressor → select_cpu path)
     if [[ $run_borrowing -eq 1 ]]; then
-        test_borrowing pipe cpu_borrowing
+        test_borrowing pipe cpu_borrowing || true
     fi
 
     # Run enqueue borrowing test (cpu stressor → enqueue path)
     if [[ $run_enqueue_borrowing -eq 1 ]]; then
-        test_borrowing cpu enqueue_borrowing
+        test_borrowing cpu enqueue_borrowing || true
     fi
 
     # Run rebalancing test
     if [[ $run_rebalancing -eq 1 ]]; then
-        test_cpu_rebalancing_demand
+        test_cpu_rebalancing_demand || true
     fi
 
     # Run cpuset change test
     if [[ $run_cpuset_change -eq 1 ]]; then
-        test_cpuset_change
+        test_cpuset_change || true
     fi
 
     # Run new cell demand test
     if [[ $run_new_cell_demand -eq 1 ]]; then
-        test_new_cell_gets_fair_share
+        test_new_cell_gets_fair_share || true
     fi
 
     # Print summary and exit

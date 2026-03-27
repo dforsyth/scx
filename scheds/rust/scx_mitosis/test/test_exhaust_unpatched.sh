@@ -1,6 +1,6 @@
 #!/bin/bash
-# Test that MUST fail on unpatched code and pass on patched code
-# Strategy: Fill all cells, remove cpusets (leak cells), try to allocate more
+# Regression test for the removed auto-managed BPF cell path.
+# Strategy: Fill all cells, remove cpusets (leak cells), try to allocate more.
 
 set -e
 
@@ -21,6 +21,12 @@ fi
 if ! pgrep -x scx_mitosis > /dev/null; then
     echo -e "${RED}scx_mitosis not running${NC}"
     exit 1
+fi
+
+if pgrep -af scx_mitosis | grep -q -- "--cell-parent-cgroup"; then
+    echo -e "${YELLOW}Skipping: running scheduler is using userspace-managed cells${NC}"
+    echo -e "${YELLOW}This regression test only applies to the removed auto-managed BPF path${NC}"
+    exit 77
 fi
 
 NUM_CPUS=$(nproc)

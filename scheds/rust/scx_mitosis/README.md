@@ -11,9 +11,13 @@ On multi-LLC systems, LLC-awareness keeps tasks on cache-sharing CPUs. In this c
 ## Usage
 
 ```bash
-# Basic
-scx_mitosis
+# Create a parent cgroup for cells and enable the CPU controller
+sudo mkdir -p /sys/fs/cgroup/workloads.slice
+echo +cpu | sudo tee /sys/fs/cgroup/workloads.slice/cgroup.subtree_control
+
+# Start mitosis in userspace-managed mode
+sudo scx_mitosis --cell-parent-cgroup /workloads.slice
 
 # With LLC-awareness
-scx_mitosis --enable-llc-awareness
+sudo scx_mitosis --cell-parent-cgroup /workloads.slice --enable-llc-awareness
 ```

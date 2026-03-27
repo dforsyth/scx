@@ -188,19 +188,6 @@ static inline s32 pick_llc_for_task(u32 cell_id)
 	return ret;
 }
 
-static void zero_cell_vtimes(struct cell *cell)
-{
-	if (enable_llc_awareness) {
-		u32 llc_idx;
-		bpf_for(llc_idx, 0, MAX_LLCS)
-		{
-			WRITE_ONCE(cell->llcs[llc_idx].vtime_now, 0);
-		}
-	} else {
-		WRITE_ONCE(cell->llcs[FAKE_FLAT_CELL_LLC].vtime_now, 0);
-	}
-}
-
 /*
  * Detect and handle cross-LLC task migration.
  * Called from running() to check if task's assigned LLC differs
