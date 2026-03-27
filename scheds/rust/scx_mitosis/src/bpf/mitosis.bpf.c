@@ -449,14 +449,73 @@ static void cstat_inc(enum cell_stat_idx idx, u32 cell, struct cpu_ctx *cctx)
 	cstat_add(idx, cell, cctx, 1);
 }
 
+/* Reject unsupported multi-CPU pinning within non-root cells. */
+static __always_inline int validate_task_affinity(struct task_struct *p,
+						  struct task_ctx    *tctx,
+						  bool shared_cell_domain)
+{
+	if (tctx->cell != 0 && reject_multicpu_pinning && !shared_cell_domain &&
+	    bpf_cpumask_weight(p->cpus_ptr) > 1) {
+		scx_bpf_error("multi-CPU pinning within cell %d not supported",
+			      tctx->cell);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/* Route a constrained task to its per-CPU DSQ and baseline vtime. */
+static __always_inline int route_task_to_cpu_dsq(struct task_struct *p,
+						 struct task_ctx    *tctx)
+{
+	struct cpu_ctx *cpu_ctx;
+	u32		cpu;
+
+	cpu = bpf_cpumask_any_distribute(p->cpus_ptr);
+	if (!(cpu_ctx = lookup_cpu_ctx(cpu)))
+		return -ENOENT;
+
+	tctx->dsq = get_cpu_dsq_id(cpu);
+	if (dsq_is_invalid(tctx->dsq))
+		return -EINVAL;
+
+	p->scx.dsq_vtime = READ_ONCE(cpu_ctx->vtime_now);
+	return 0;
+}
+
+/* Route a shared-cell task to its cell DSQ and baseline vtime. */
+static __always_inline int route_task_to_cell_dsq(struct task_struct *p,
+						  struct task_ctx    *tctx)
+{
+	struct bpf_cpumask *primary_mask __free(bpf_cpumask) = NULL;
+	struct cell			*cell;
+
+	if (enable_llc_awareness) {
+		primary_mask = bpf_cpumask_create();
+		if (!primary_mask)
+			return -ENOMEM;
+		if (task_primary_mask(p, tctx, primary_mask))
+			return -ENOENT;
+		return update_task_llc_assignment(
+			p, tctx, (const struct cpumask *)primary_mask);
+	}
+
+	tctx->dsq = get_cell_llc_dsq_id(tctx->cell, FAKE_FLAT_CELL_LLC);
+	if (dsq_is_invalid(tctx->dsq))
+		return -EINVAL;
+
+	if (!(cell = lookup_cell(tctx->cell)))
+		return -ENOENT;
+
+	p->scx.dsq_vtime = READ_ONCE(cell->llcs[FAKE_FLAT_CELL_LLC].vtime_now);
+	return 0;
+}
+
 /* Refresh the task's DSQ and vtime baseline from current cell state. */
 static inline int update_task_routing(struct task_struct *p,
 				      struct task_ctx	 *tctx)
 {
-	struct cpu_ctx			*cpu_ctx;
-	struct bpf_cpumask *primary_mask __free(bpf_cpumask) = NULL;
-	u32				 cpu;
-	bool				 shared_cell_domain;
+	bool shared_cell_domain;
 
 	shared_cell_domain = task_can_use_shared_cell_domain(p, tctx->cell);
 
@@ -464,14 +523,10 @@ static inline int update_task_routing(struct task_struct *p,
 	* Single-CPU pinning is fine (even if outside this cell).
 	* However, multi-CPU pinning that doesn't cover the entire
 	* cell is not supported - the scheduler can't efficiently
-	* handle partial affinity restrictions.
+	 * handle partial affinity restrictions.
 	 */
-	if (tctx->cell != 0 && reject_multicpu_pinning && !shared_cell_domain &&
-	    bpf_cpumask_weight(p->cpus_ptr) > 1) {
-		scx_bpf_error("multi-CPU pinning within cell %d not supported",
-			      tctx->cell);
+	if (validate_task_affinity(p, tctx, shared_cell_domain))
 		return -EINVAL;
-	}
 
 	/*
 	 * XXX - To be correct, we'd need to calculate the vtime
@@ -485,43 +540,10 @@ static inline int update_task_routing(struct task_struct *p,
 	 */
 
 	/* Per-CPU pinned path */
-	if (!shared_cell_domain) {
-		cpu = bpf_cpumask_any_distribute(p->cpus_ptr);
-		if (!(cpu_ctx = lookup_cpu_ctx(cpu)))
-			return -ENOENT;
+	if (!shared_cell_domain)
+		return route_task_to_cpu_dsq(p, tctx);
 
-		tctx->dsq = get_cpu_dsq_id(cpu);
-		if (dsq_is_invalid(tctx->dsq))
-			return -EINVAL;
-
-		p->scx.dsq_vtime = READ_ONCE(cpu_ctx->vtime_now);
-		return 0;
-	}
-
-	/* Cell-wide path */
-	/* LLC aware version */
-	if (enable_llc_awareness) {
-		primary_mask = bpf_cpumask_create();
-		if (!primary_mask)
-			return -ENOMEM;
-		if (task_primary_mask(p, tctx, primary_mask))
-			return -ENOENT;
-		return update_task_llc_assignment(
-			p, tctx, (const struct cpumask *)primary_mask);
-	}
-
-	/* Non-LLC aware version */
-	tctx->dsq = get_cell_llc_dsq_id(tctx->cell, FAKE_FLAT_CELL_LLC);
-	if (dsq_is_invalid(tctx->dsq))
-		return -EINVAL;
-
-	struct cell *cell;
-	if (!(cell = lookup_cell(tctx->cell)))
-		return -ENOENT;
-
-	p->scx.dsq_vtime = READ_ONCE(cell->llcs[FAKE_FLAT_CELL_LLC].vtime_now);
-
-	return 0;
+	return route_task_to_cell_dsq(p, tctx);
 }
 
 /* Resolve the task's current cgroup ownership into a live cell id. */
