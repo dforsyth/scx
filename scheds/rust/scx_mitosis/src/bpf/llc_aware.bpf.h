@@ -224,10 +224,10 @@ static inline int maybe_retag_stolen_task(struct task_struct *p,
 	tctx->llc = cctx->llc;
 
 	/*
-	 * New LLC, need new cpumask. This updates the task vtime
+	 * New LLC, need new routing. This updates the task vtime
 	 * to that of the new cell-LLC DSQ.
 	 */
-	return update_task_cpumask(p, tctx);
+	return update_task_routing(p, tctx);
 }
 
 /* Work stealing:
@@ -300,15 +300,17 @@ static inline s32 try_stealing_work(u32 cell, s32 local_llc)
 	return false;
 }
 
-static inline int update_task_llc_assignment(struct task_struct *p,
-					     struct task_ctx	*tctx)
+/* Pick a cell LLC for the task and route it through that LLC's DSQ. */
+static inline int update_task_llc_assignment(struct task_struct	  *p,
+					     struct task_ctx	  *tctx,
+					     const struct cpumask *allowed_mask)
 {
 	if (!tctx) {
 		scx_bpf_error("Invalid task context");
 		return -ENOENT;
 	}
 
-	const struct cpumask *llc_mask = NULL;
+	const struct cpumask *llc_mask;
 
 	// Let's get a new LLC for this task
 	s32 new_llc = pick_llc_for_task(tctx->cell);
@@ -320,14 +322,18 @@ static inline int update_task_llc_assignment(struct task_struct *p,
 	if (!llc_mask)
 		return -ENOENT;
 
-	/* --- Narrow the effective cpumask by the chosen LLC --- */
-	/* tctx->cpumask already contains (task_affinity & cell_mask) */
-	struct bpf_cpumask *cpumask = tctx->cpumask;
-	if (!cpumask) {
-		scx_bpf_error("tctx->cpumask is NULL");
+	if (!allowed_mask) {
+		scx_bpf_error("allowed_mask is NULL");
 		return -EINVAL;
 	}
-	bpf_cpumask_and(cpumask, (const struct cpumask *)cpumask, llc_mask);
+
+	struct bpf_cpumask *cpumask __free(bpf_cpumask) = bpf_cpumask_create();
+	if (!cpumask) {
+		scx_bpf_error("Failed to allocate LLC cpumask");
+		return -ENOMEM;
+	}
+
+	bpf_cpumask_and(cpumask, allowed_mask, llc_mask);
 
 	/* If empty after intersection, nothing can run here */
 	if (bpf_cpumask_empty((const struct cpumask *)cpumask)) {

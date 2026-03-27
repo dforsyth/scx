@@ -59,9 +59,6 @@ static inline struct cell *lookup_cell(int idx)
  * task_ctx is the per-task information kept by scx_mitosis
  */
 struct task_ctx {
-	/* cpumask is the set of valid cpus this task can schedule on */
-	/* (task's cpumask and-ed with its cell cpumask) */
-	struct bpf_cpumask __kptr *cpumask;
 	/* started_running_at for recording runtime */
 	u64 started_running_at;
 	u64 basis_vtime;
@@ -70,11 +67,6 @@ struct task_ctx {
 	/* For the sake of scheduling, a task is exclusively owned by either a cell
 	 * or a cpu */
 	dsq_id_t dsq;
-	/* latest configuration that was applied for this task */
-	/* (to know if it has to be re-applied) */
-	u32 configuration_seq;
-	/* Is this task allowed on all cores of its cell? */
-	bool all_cell_cpus_allowed;
 	/* Set when task is dispatched to a borrowed CPU from another cell.
 	 * Consumed and cleared in mitosis_stopping to avoid advancing the
 	 * lending cell's per-CPU DSQ vtime with this task's execution.
@@ -99,5 +91,5 @@ struct cell_map {
 	__uint(max_entries, MAX_CELLS);
 };
 
-static inline int update_task_cpumask(struct task_struct *p,
+static inline int update_task_routing(struct task_struct *p,
 				      struct task_ctx	 *tctx);

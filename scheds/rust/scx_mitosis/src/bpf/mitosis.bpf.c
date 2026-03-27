@@ -449,31 +449,24 @@ static void cstat_inc(enum cell_stat_idx idx, u32 cell, struct cpu_ctx *cctx)
 	cstat_add(idx, cell, cctx, 1);
 }
 
-static inline int update_task_cpumask(struct task_struct *p,
+/* Refresh the task's DSQ and vtime baseline from current cell state. */
+static inline int update_task_routing(struct task_struct *p,
 				      struct task_ctx	 *tctx)
 {
-	const struct cpumask *cell_cpumask;
-	struct cpu_ctx	     *cpu_ctx;
-	u32		      cpu;
+	struct cpu_ctx			*cpu_ctx;
+	struct bpf_cpumask *primary_mask __free(bpf_cpumask) = NULL;
+	u32				 cpu;
+	bool				 shared_cell_domain;
 
-	if (!(cell_cpumask = lookup_cell_cpumask(tctx->cell)))
-		return -ENOENT;
-
-	if (!tctx->cpumask)
-		return -EINVAL;
-
-	bpf_cpumask_and(tctx->cpumask, cell_cpumask, p->cpus_ptr);
-	tctx->all_cell_cpus_allowed =
-		task_can_use_shared_cell_domain(p, tctx->cell);
+	shared_cell_domain = task_can_use_shared_cell_domain(p, tctx->cell);
 
 	/*
 	* Single-CPU pinning is fine (even if outside this cell).
 	* However, multi-CPU pinning that doesn't cover the entire
 	* cell is not supported - the scheduler can't efficiently
 	* handle partial affinity restrictions.
-	*/
-	if (tctx->cell != 0 && reject_multicpu_pinning &&
-	    !tctx->all_cell_cpus_allowed &&
+	 */
+	if (tctx->cell != 0 && reject_multicpu_pinning && !shared_cell_domain &&
 	    bpf_cpumask_weight(p->cpus_ptr) > 1) {
 		scx_bpf_error("multi-CPU pinning within cell %d not supported",
 			      tctx->cell);
@@ -492,7 +485,7 @@ static inline int update_task_cpumask(struct task_struct *p,
 	 */
 
 	/* Per-CPU pinned path */
-	if (!tctx->all_cell_cpus_allowed) {
+	if (!shared_cell_domain) {
 		cpu = bpf_cpumask_any_distribute(p->cpus_ptr);
 		if (!(cpu_ctx = lookup_cpu_ctx(cpu)))
 			return -ENOENT;
@@ -508,7 +501,13 @@ static inline int update_task_cpumask(struct task_struct *p,
 	/* Cell-wide path */
 	/* LLC aware version */
 	if (enable_llc_awareness) {
-		return update_task_llc_assignment(p, tctx);
+		primary_mask = bpf_cpumask_create();
+		if (!primary_mask)
+			return -ENOMEM;
+		if (task_primary_mask(p, tctx, primary_mask))
+			return -ENOENT;
+		return update_task_llc_assignment(
+			p, tctx, (const struct cpumask *)primary_mask);
 	}
 
 	/* Non-LLC aware version */
@@ -525,10 +524,7 @@ static inline int update_task_cpumask(struct task_struct *p,
 	return 0;
 }
 
-/*
- * Figure out the task's cell, dsq and store the corresponding cpumask in the
- * task_ctx.
- */
+/* Figure out the task's cell and refresh its routing state. */
 static inline int update_task_cell(struct task_struct *p, struct task_ctx *tctx,
 				   struct cgroup *cg)
 {
@@ -564,29 +560,22 @@ static inline int update_task_cell(struct task_struct *p, struct task_ctx *tctx,
 		}
 	}
 
-	/*
-	 * This ordering is pretty important, we read applied_configuration_seq
-	 * before reading everything else expecting that the updater will update
-	 * everything and then bump applied_configuration_seq last. This ensures
-	 * that we cannot miss an update.
-	 */
-	tctx->configuration_seq = READ_ONCE(applied_configuration_seq);
-	barrier();
 	tctx->cell = cgc->cell;
 	tctx->cgid = cg->kn->id;
 
-	return update_task_cpumask(p, tctx);
+	/* Task ownership changed, so rebuild its DSQ routing from live cell state. */
+	return update_task_routing(p, tctx);
 }
 
-/*
- * Get task's cgroup, update its cell, and release the cgroup.
- */
+/* Get task's cgroup, update its cell, and release the cgroup. */
 static __always_inline int refresh_task_cell(struct task_struct *p,
 					     struct task_ctx	*tctx)
 {
 	struct cgroup *cgrp __free(cgroup) = task_cgroup(p);
+
 	if (!cgrp)
 		return -1;
+
 	return update_task_cell(p, tctx, cgrp);
 }
 
@@ -619,11 +608,11 @@ static s32 pick_idle_cpu_from(struct task_struct   *p,
 	return scx_bpf_pick_idle_cpu(cand_cpumask, 0);
 }
 
-/* Check if we need to update the cell/cpumask mapping */
+/* Refresh task cell ownership when the active cgroup state may have changed. */
 static __always_inline int maybe_refresh_cell(struct task_struct *p,
 					      struct task_ctx	 *tctx)
 {
-	if (tctx->configuration_seq != READ_ONCE(applied_configuration_seq))
+	if (userspace_managed_cell_mode)
 		return refresh_task_cell(p, tctx);
 
 	/*
@@ -1745,12 +1734,8 @@ void BPF_STRUCT_OPS(mitosis_set_cpumask, struct task_struct *p,
 	if (!(tctx = lookup_task_ctx(p)))
 		return;
 
-	if (!all_cpumask) {
-		scx_bpf_error("NULL all_cpumask");
-		return;
-	}
-
-	update_task_cpumask(p, tctx);
+	/* Affinity changes can move the task between constrained and shared routing. */
+	update_task_routing(p, tctx);
 }
 
 s32 validate_flags()
@@ -1785,8 +1770,7 @@ s32 validate_userspace_data()
 
 static int init_task_impl(struct task_struct *p, struct cgroup *cgrp)
 {
-	struct task_ctx	   *tctx;
-	struct bpf_cpumask *cpumask;
+	struct task_ctx *tctx;
 
 	record_init_task(cgrp->kn->id, p->pid);
 
@@ -1795,23 +1779,6 @@ static int init_task_impl(struct task_struct *p, struct cgroup *cgrp)
 	if (!tctx) {
 		scx_bpf_error("task_ctx allocation failure");
 		return -ENOMEM;
-	}
-
-	cpumask = bpf_cpumask_create();
-	if (!cpumask)
-		return -ENOMEM;
-
-	cpumask = bpf_kptr_xchg(&tctx->cpumask, cpumask);
-	if (cpumask) {
-		/* Should never happen as we just inserted it above. */
-		bpf_cpumask_release(cpumask);
-		scx_bpf_error("tctx cpumask is unexpectedly populated on init");
-		return -EINVAL;
-	}
-
-	if (!all_cpumask) {
-		scx_bpf_error("missing all_cpumask");
-		return -EINVAL;
 	}
 
 	/* Initialize LLC assignment fields */
@@ -1980,14 +1947,17 @@ void BPF_STRUCT_OPS(mitosis_dump_task, struct scx_dump_ctx *dctx,
 		    struct task_struct *p)
 {
 	struct task_ctx *tctx;
+	bool		 shared_cell_domain;
 
 	if (!(tctx = lookup_task_ctx(p)))
 		return;
 
+	shared_cell_domain = task_can_use_shared_cell_domain(p, tctx->cell);
+
 	scx_bpf_dump(
 		"Task[%d] vtime=%llu basis_vtime=%llu cell=%u dsq=%llx all_cell_cpus_allowed=%d\n",
 		p->pid, p->scx.dsq_vtime, tctx->basis_vtime, tctx->cell,
-		tctx->dsq.raw, tctx->all_cell_cpus_allowed);
+		tctx->dsq.raw, shared_cell_domain);
 	scx_bpf_dump("Task[%d] CPUS=", p->pid);
 	dump_cpumask(p->cpus_ptr);
 	scx_bpf_dump("\n");
