@@ -511,6 +511,64 @@ static __always_inline int route_task_to_cell_dsq(struct task_struct *p,
 	return 0;
 }
 
+/* Pick a fallback CPU from the task's current primary mask. */
+static __always_inline s32 task_primary_fallback_cpu(struct task_struct *p,
+						     s32	      prev_cpu,
+						     struct task_ctx *tctx)
+{
+	struct bpf_cpumask *fallback_mask __free(bpf_cpumask) =
+		bpf_cpumask_create();
+
+	if (!fallback_mask) {
+		scx_bpf_error("Failed to allocate task fallback cpumask");
+		return -1;
+	}
+	if (task_primary_mask(p, tctx, fallback_mask))
+		return -1;
+
+	if (!bpf_cpumask_test_cpu(prev_cpu,
+				  (const struct cpumask *)fallback_mask))
+		return bpf_cpumask_any_distribute(
+			(const struct cpumask *)fallback_mask);
+
+	return prev_cpu;
+}
+
+/* Read the task's vtime baseline from its active dispatch domain. */
+static __always_inline int task_basis_vtime(struct task_ctx *tctx, s32 cpu,
+					    bool shared_cell_domain,
+					    u64 *basis_vtime)
+{
+	struct cpu_ctx *cpu_ctx;
+	struct cell    *cell;
+
+	if (shared_cell_domain) {
+		if (!(cell = lookup_cell(tctx->cell)))
+			return -ENOENT;
+
+		if (enable_llc_awareness) {
+			if (!llc_is_valid(tctx->llc)) {
+				scx_bpf_error("Invalid LLC ID: %d", tctx->llc);
+				return -EINVAL;
+			}
+
+			*basis_vtime =
+				READ_ONCE(cell->llcs[tctx->llc].vtime_now);
+		} else {
+			*basis_vtime = READ_ONCE(
+				cell->llcs[FAKE_FLAT_CELL_LLC].vtime_now);
+		}
+
+		return 0;
+	}
+
+	if (!(cpu_ctx = lookup_cpu_ctx(cpu)))
+		return -ENOENT;
+
+	*basis_vtime = READ_ONCE(cpu_ctx->vtime_now);
+	return 0;
+}
+
 /* Refresh the task's DSQ and vtime baseline from current cell state. */
 static inline int update_task_routing(struct task_struct *p,
 				      struct task_ctx	 *tctx)
@@ -804,12 +862,10 @@ static __always_inline s32 try_pick_idle_cpu(struct task_struct *p,
 s32 BPF_STRUCT_OPS(mitosis_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
-	s32				  cpu;
-	struct cpu_ctx			 *cctx;
-	struct task_ctx			 *tctx;
-	struct bpf_cpumask *fallback_mask __free(bpf_cpumask) =
-		bpf_cpumask_create();
-	bool shared_cell_domain;
+	s32		 cpu;
+	struct cpu_ctx	*cctx;
+	struct task_ctx *tctx;
+	bool		 shared_cell_domain;
 
 	if (!(cctx = lookup_cpu_ctx(-1)) || !(tctx = lookup_task_ctx(p)))
 		return prev_cpu;
@@ -834,23 +890,10 @@ s32 BPF_STRUCT_OPS(mitosis_select_cpu, struct task_struct *p, s32 prev_cpu,
 	if ((cpu = try_pick_idle_cpu(p, prev_cpu, cctx, tctx, false)) >= 0)
 		return cpu;
 
-	if (!fallback_mask) {
-		scx_bpf_error("Failed to allocate task fallback cpumask");
+	/* No idle CPU was available, so fall back to the current primary mask. */
+	cpu = task_primary_fallback_cpu(p, prev_cpu, tctx);
+	if (cpu < 0)
 		return prev_cpu;
-	}
-	if (task_primary_mask(p, tctx, fallback_mask))
-		return prev_cpu;
-
-	/*
-	 * All else failed, send it to the prev cpu (if that's valid), otherwise any
-	 * valid cpu.
-	 */
-	if (!bpf_cpumask_test_cpu(prev_cpu,
-				  (const struct cpumask *)fallback_mask))
-		cpu = bpf_cpumask_any_distribute(
-			(const struct cpumask *)fallback_mask);
-	else
-		cpu = prev_cpu;
 
 	return cpu;
 }
@@ -859,7 +902,6 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	struct cpu_ctx	*cctx;
 	struct task_ctx *tctx;
-	struct cell	*cell;
 	s32		 task_cpu = scx_bpf_task_cpu(p);
 	u64		 vtime;
 	s32		 cpu = -1;
@@ -895,50 +937,21 @@ void BPF_STRUCT_OPS(mitosis_enqueue, struct task_struct *p, u64 enq_flags)
 		if (cpu == -1)
 			return;
 		if (cpu == -EBUSY) {
-			struct bpf_cpumask *fallback_mask __free(bpf_cpumask) =
-				bpf_cpumask_create();
-			if (!fallback_mask) {
-				scx_bpf_error(
-					"Failed to allocate enqueue fallback cpumask");
+			/* No idle CPU was available, so fall back to the current primary mask. */
+			cpu = task_primary_fallback_cpu(p, task_cpu, tctx);
+			if (cpu < 0)
 				return;
-			}
-			if (task_primary_mask(p, tctx, fallback_mask))
-				return;
-			cpu = bpf_cpumask_any_distribute(
-				(const struct cpumask *)fallback_mask);
 		}
 	}
 
-	if (shared_cell_domain) {
+	if (shared_cell_domain)
 		cstat_inc(CSTAT_CELL_DSQ, tctx->cell, cctx);
-		/* Task can use any CPU in its cell, so use the cell DSQ */
-		if (!(cell = lookup_cell(tctx->cell)))
-			return;
-
-		if (enable_llc_awareness) {
-			if (!llc_is_valid(tctx->llc)) {
-				scx_bpf_error("Invalid LLC ID: %d", tctx->llc);
-				return;
-			}
-
-			basis_vtime =
-				READ_ONCE(cell->llcs[tctx->llc].vtime_now);
-		} else {
-			basis_vtime = READ_ONCE(
-				cell->llcs[FAKE_FLAT_CELL_LLC].vtime_now);
-		}
-	} else {
+	else
 		cstat_inc(CSTAT_CPU_DSQ, tctx->cell, cctx);
 
-		/*
-		 * cctx is the local core cpu (where enqueue is running), not the core
-		 * the task belongs to. Fetch the right cctx
-		 */
-		if (!(cctx = lookup_cpu_ctx(cpu)))
-			return;
-		/* Task is pinned to specific CPUs, use per-CPU DSQ */
-		basis_vtime = READ_ONCE(cctx->vtime_now);
-	}
+	/* Read the baseline from the queueing domain we just selected. */
+	if (task_basis_vtime(tctx, cpu, shared_cell_domain, &basis_vtime))
+		return;
 
 	tctx->basis_vtime = basis_vtime;
 
