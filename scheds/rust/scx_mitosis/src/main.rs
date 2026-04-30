@@ -8,10 +8,12 @@ mod bpf_skel;
 pub use bpf_skel::*;
 pub mod bpf_intf;
 mod cell_manager;
+mod log_events;
 mod mitosis_topology_utils;
 mod stats;
 
 use cell_manager::{CellManager, CpuAssignment};
+use log_events::{cell as cell_log, queue as queue_log, sched as sched_log};
 
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
@@ -338,7 +340,9 @@ impl<'a> Scheduler<'a> {
             .debug(opts.log_level.contains("trace"));
         init_libbpf_logging(None);
         info!(
-            "Running scx_mitosis (build ID: {})",
+            "{}:name={}:build_id={}",
+            sched_log::START,
+            SCHEDULER_NAME,
             build_id::full_version(env!("CARGO_PKG_VERSION"))
         );
 
@@ -392,7 +396,7 @@ impl<'a> Scheduler<'a> {
         rodata.use_lockless_peek = opts.use_lockless_peek;
 
         match *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP {
-            0 => info!("Kernel does not support queued wakeup optimization."),
+            0 => info!("{}", sched_log::QUEUED_WAKEUP_UNSUPPORTED),
             v => skel.struct_ops.mitosis_mut().flags |= v,
         }
 
@@ -494,7 +498,7 @@ impl<'a> Scheduler<'a> {
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
         let struct_ops = scx_ops_attach!(self.skel, mitosis).context("attaching BPF scheduler")?;
 
-        info!("Mitosis Scheduler Attached. Run `scx_mitosis --monitor` for metrics.");
+        info!("{}:name={}", sched_log::ATTACH, SCHEDULER_NAME);
 
         // Apply initial cell configuration if CellManager is active
         self.apply_initial_cells()
@@ -571,8 +575,25 @@ impl<'a> Scheduler<'a> {
         // Drop stats_server to close the channel, allowing stats_bridge to exit
         drop(self.stats_server.take());
         let _ = stats_bridge.join();
-        info!("Unregister {SCHEDULER_NAME} scheduler");
+        info!("{}:name={}", sched_log::DETACH, SCHEDULER_NAME);
         uei_report!(&self.skel, uei)
+    }
+
+    fn log_cell_layout(&self, reason: &str, cpu_assignments: &[CpuAssignment]) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+
+        let Some(cell_manager) = self.cell_manager.as_ref() else {
+            return;
+        };
+
+        debug!(
+            "{}:reason={}:map={}",
+            cell_log::LAYOUT,
+            reason,
+            cell_manager.format_cell_config(cpu_assignments)
+        );
     }
 
     /// Apply initial cell assignments discovered at startup
@@ -585,14 +606,8 @@ impl<'a> Scheduler<'a> {
             .compute_and_apply_cell_config(&[])
             .context("computing initial cell configuration")?;
 
-        let cell_manager = self
-            .cell_manager
-            .as_ref()
-            .expect("BUG: cell_manager missing in apply_initial_cells");
-        info!(
-            "Applied initial cell configuration: {}",
-            cell_manager.format_cell_config(&cpu_assignments)
-        );
+        info!("{}:num_cells={}", cell_log::INIT, cpu_assignments.len());
+        self.log_cell_layout("init", &cpu_assignments);
 
         Ok(())
     }
@@ -631,16 +646,14 @@ impl<'a> Scheduler<'a> {
             .compute_and_apply_cell_config(&new_cell_ids)
             .context("recomputing cell configuration for new cgroups")?;
 
-        let cell_manager = self
-            .cell_manager
-            .as_ref()
-            .expect("BUG: cell_manager missing in process_cell_events");
         info!(
-            "Cell config updated ({} new, {} destroyed): {}",
+            "{}:new={}:destroyed={}:num_cells={}",
+            cell_log::UPDATE,
             num_new,
             num_destroyed,
-            cell_manager.format_cell_config(&cpu_assignments)
+            cpu_assignments.len()
         );
+        self.log_cell_layout("update", &cpu_assignments);
 
         Ok(())
     }
@@ -689,9 +702,11 @@ impl<'a> Scheduler<'a> {
                         existing_utils.iter().sum::<f64>() / existing_utils.len().max(1) as f64;
                     for &id in new_cell_ids {
                         self.smoothed_util[id as usize] = avg_util;
-                        info!(
-                            "Seeded new cell {} smoothed_util to average {:.1}%",
-                            id, avg_util
+                        debug!(
+                            "{}:id={}:util_pct={:.1}",
+                            cell_log::SEED_DEMAND,
+                            id,
+                            avg_util
                         );
                     }
 
@@ -791,16 +806,14 @@ impl<'a> Scheduler<'a> {
         self.rebalance_count += 1;
         self.metrics.rebalance_count = self.rebalance_count;
 
-        let cell_manager = self
-            .cell_manager
-            .as_ref()
-            .expect("BUG: cell_manager missing after apply_cell_config in maybe_rebalance");
         info!(
-            "Rebalanced CPUs (spread={:.1}%, count={}): {}",
+            "{}:spread_pct={:.1}:count={}:num_cells={}",
+            cell_log::REBAL,
             spread,
             self.rebalance_count,
-            cell_manager.format_cell_config(&cpu_assignments)
+            cpu_assignments.len()
         );
+        self.log_cell_layout("rebal", &cpu_assignments);
 
         Ok(())
     }
@@ -1110,7 +1123,7 @@ impl<'a> Scheduler<'a> {
             .sum();
 
         if global_queue_decisions == 0 {
-            warn!("No queueing decisions made globally");
+            debug!("{}", queue_log::IDLE_GLOBAL);
             return Ok(());
         }
 
@@ -1359,14 +1372,12 @@ impl<'a> Scheduler<'a> {
             .compute_and_apply_cell_config(&[])
             .context("recomputing cell configuration after cpuset change")?;
         self.update_applied_cpuset_seq();
-        let cell_manager = self
-            .cell_manager
-            .as_ref()
-            .expect("BUG: cell_manager missing in check_cpuset_changes");
         info!(
-            "Cpuset change detected, recomputed config: {}",
-            cell_manager.format_cell_config(&cpu_assignments)
+            "{}:num_cells={}",
+            cell_log::CPUSET_CHANGE,
+            cpu_assignments.len()
         );
+        self.log_cell_layout("cpuset-change", &cpu_assignments);
         Ok(())
     }
 
@@ -1513,13 +1524,13 @@ fn main(opts: Opts) -> Result<()> {
     }
 
     if opts.verbose > 0 {
-        warn!("Setting verbose via -v is deprecated and will be an error in future releases.");
+        warn!("{}:flag=-v", sched_log::VERBOSE_FLAG_DEPRECATED);
     }
 
     debug!("opts={:?}", &opts);
 
     if let Some(run_id) = opts.run_id {
-        info!("scx_mitosis run_id: {}", run_id);
+        info!("{}:id={}", sched_log::RUN_ID, run_id);
     }
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -1533,14 +1544,9 @@ fn main(opts: Opts) -> Result<()> {
         let shutdown_clone = shutdown.clone();
         let jh = std::thread::spawn(move || {
             match stats::monitor(Duration::from_secs_f64(intv), shutdown_clone) {
-                Ok(_) => {
-                    debug!("stats monitor thread finished successfully")
-                }
+                Ok(_) => debug!("{}", sched_log::STATS_MONITOR_EXIT),
                 Err(error_object) => {
-                    warn!(
-                        "stats monitor thread finished because of an error {}",
-                        error_object
-                    )
+                    warn!("{}:error={}", sched_log::STATS_MONITOR_ERROR, error_object)
                 }
             }
         });

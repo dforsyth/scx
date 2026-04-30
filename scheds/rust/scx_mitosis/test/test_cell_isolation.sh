@@ -272,7 +272,7 @@ start_scheduler() {
 
     # Show which cells were created
     log_info "Scheduler log (cell creation):"
-    grep -E "(Created cell|Assigning)" "$LOG_FILE" | head -10 || true
+    grep -E "(cell:create:|Assigning)" "$LOG_FILE" | head -10 || true
 }
 
 # Start workloads in each cell
@@ -438,7 +438,7 @@ test_dynamic_cell_lifecycle() {
     sleep 3  # Wait for inotify to fire and scheduler to process
 
     # Verify scheduler log shows new cell
-    if ! grep -q "Created cell.*test_cell_dynamic" "$LOG_FILE"; then
+    if ! grep -q "cell:create:.*name=test_cell_dynamic" "$LOG_FILE"; then
         log_error "Dynamic cell creation not detected in logs"
         record_result "dynamic_cell_lifecycle" "FAILED"
         return 1
@@ -478,7 +478,7 @@ test_dynamic_cell_lifecycle() {
     sleep 3
 
     # Verify destruction logged
-    if ! grep -q "Destroyed cell.*test_cell_dynamic" "$LOG_FILE"; then
+    if ! grep -q "cell:destroy:.*name=test_cell_dynamic" "$LOG_FILE"; then
         log_error "Cell destruction not detected in logs"
         log_info "Log contents related to test_cell_dynamic:"
         grep "test_cell_dynamic" "$LOG_FILE" || echo "(no matches)"
@@ -496,7 +496,7 @@ test_cpu_reallocation() {
     log_info "=== Running test: CPU Reallocation ==="
 
     # Count lines with cell configuration messages before adding new cell
-    local config_count_before=$(grep -c "Cell config updated\|Applied initial cell configuration" "$LOG_FILE" || echo "0")
+    local config_count_before=$(grep -c "cell:init:\|cell:update:" "$LOG_FILE" || echo "0")
 
     # Add a third cell
     local cell_path="$CGROUP_BASE/test_cell_3"
@@ -509,7 +509,7 @@ test_cpu_reallocation() {
     sleep 3
 
     # Count configuration applications after
-    local config_count_after=$(grep -c "Cell config updated\|Applied initial cell configuration" "$LOG_FILE" || echo "0")
+    local config_count_after=$(grep -c "cell:init:\|cell:update:" "$LOG_FILE" || echo "0")
 
     if [[ "$config_count_after" -gt "$config_count_before" ]]; then
         log_info "Cell configuration was reapplied after adding new cell"
@@ -543,7 +543,7 @@ test_cell_id_reuse() {
     sleep 2
 
     # Get the cell ID from log
-    local cell_id=$(grep "Created cell.*test_cell_reuse_a" "$LOG_FILE" | tail -1 | grep -oP "cell \K\d+" || echo "")
+    local cell_id=$(grep "cell:create:.*name=test_cell_reuse_a" "$LOG_FILE" | tail -1 | grep -oP "cell:create:id=\K\d+" || echo "")
 
     if [[ -z "$cell_id" ]]; then
         log_error "Could not find cell ID for test_cell_reuse_a"
@@ -561,7 +561,7 @@ test_cell_id_reuse() {
     sudo mkdir "$cell_path_b"
     sleep 2
 
-    local new_cell_id=$(grep "Created cell.*test_cell_reuse_b" "$LOG_FILE" | tail -1 | grep -oP "cell \K\d+" || echo "")
+    local new_cell_id=$(grep "cell:create:.*name=test_cell_reuse_b" "$LOG_FILE" | tail -1 | grep -oP "cell:create:id=\K\d+" || echo "")
 
     if [[ -z "$new_cell_id" ]]; then
         log_error "Could not find cell ID for test_cell_reuse_b"
@@ -855,7 +855,7 @@ def parse_first_json(path):
 cell_name_map = {}
 with open('$LOG_FILE', 'r') as f:
     for line in f:
-        m = re.search(r'Created cell (\d+) for cgroup \S+/(test_cell_rebal_\w+)', line)
+        m = re.search(r'cell:create:id=(\d+):name=(test_cell_rebal_\w+):cgid=\d+', line)
         if m:
             cell_name_map[m.group(1)] = m.group(2)
 
@@ -1027,7 +1027,7 @@ test_cpuset_change() {
     sleep 5
 
     # Verify scheduler detected the change
-    if ! grep -q "Cpuset change detected" "$LOG_FILE"; then
+    if ! grep -q "cell:cpuset-change:" "$LOG_FILE"; then
         log_error "Cpuset change not detected in scheduler logs"
         log_info "Scheduler log tail:"
         tail -20 "$LOG_FILE"
@@ -1209,7 +1209,7 @@ def parse_first_json(path):
 cell_name_map = {}
 with open('$LOG_FILE', 'r') as f:
     for line in f:
-        m = re.search(r'Created cell (\d+) for cgroup \S+/(test_cell_demand_\w+)', line)
+        m = re.search(r'cell:create:id=(\d+):name=(test_cell_demand_\w+):cgid=\d+', line)
         if m:
             cell_name_map[m.group(1)] = m.group(2)
 

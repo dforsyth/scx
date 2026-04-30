@@ -19,6 +19,8 @@ use inotify::{Inotify, WatchMask};
 use scx_utils::Cpumask;
 use tracing::{debug, info};
 
+use crate::log_events::cell as cell_log;
+
 /// Information about a cell created for a cgroup
 #[derive(Debug)]
 pub struct CellInfo {
@@ -223,6 +225,12 @@ pub struct CellManager {
 }
 
 impl CellManager {
+    fn cgroup_name(path: &Path) -> String {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "?".to_string())
+    }
+
     pub fn new(
         cell_parent_path: &str,
         max_cells: u32,
@@ -426,9 +434,10 @@ impl CellManager {
                 true
             } else {
                 info!(
-                    "Destroyed cell {} for cgroup {} (cgid={})",
+                    "{}:id={}:name={}:cgid={}",
+                    cell_log::DESTROY,
                     info.cell_id,
-                    cgroup_path.display(),
+                    Self::cgroup_name(cgroup_path),
                     cgid
                 );
                 destroyed_cells.insert(info.cell_id);
@@ -462,10 +471,11 @@ impl CellManager {
             .with_context(|| format!("reading cpuset for cgroup {}", path.display()))?;
         if let Some(ref mask) = cpuset {
             debug!(
-                "Cell {} has cpuset: {} (from {})",
+                "{}:id={}:name={}:cpus={}",
+                cell_log::CPUSET,
                 cell_id,
-                mask.to_cpulist(),
-                path.join("cpuset.cpus").display()
+                Self::cgroup_name(path),
+                mask.to_cpulist()
             );
         }
 
@@ -481,9 +491,10 @@ impl CellManager {
         self.cell_id_to_cgid.insert(cell_id, cgid);
 
         info!(
-            "Created cell {} for cgroup {} (cgid={})",
+            "{}:id={}:name={}:cgid={}",
+            cell_log::CREATE,
             cell_id,
-            path.display(),
+            Self::cgroup_name(path),
             cgid
         );
 
@@ -855,12 +866,19 @@ impl CellManager {
             let new_cpuset = Self::read_cpuset(cgroup_path)
                 .with_context(|| format!("reading cpuset for cgroup {}", cgroup_path.display()))?;
             if new_cpuset != info.cpuset {
-                info!(
-                    "Cell {} cpuset changed: {:?} -> {:?} ({})",
+                debug!(
+                    "{}:id={}:name={}:from={}:to={}",
+                    cell_log::CPUSET,
                     info.cell_id,
-                    info.cpuset.as_ref().map(|m| m.to_cpulist()),
-                    new_cpuset.as_ref().map(|m| m.to_cpulist()),
-                    cgroup_path.display(),
+                    Self::cgroup_name(cgroup_path),
+                    info.cpuset
+                        .as_ref()
+                        .map(|m| m.to_cpulist())
+                        .unwrap_or_else(|| "-".to_string()),
+                    new_cpuset
+                        .as_ref()
+                        .map(|m| m.to_cpulist())
+                        .unwrap_or_else(|| "-".to_string()),
                 );
                 info.cpuset = new_cpuset;
                 changed = true;
