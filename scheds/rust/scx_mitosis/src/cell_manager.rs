@@ -2646,6 +2646,143 @@ mod tests {
     // ==================== Overlapping cpuset tests ====================
 
     #[test]
+    fn test_cpu_assignments_overlap_does_not_starve_narrow_higher_id_cell() {
+        let tmp = TempDir::new().unwrap();
+
+        // Directory sorting deterministically gives the wider cell ID 1 and
+        // the narrower cell ID 2. CPU 1 is exclusive to the wider cell while
+        // CPU 0 is contested. Both cells have a deficit of 1 when CPU 0 is
+        // distributed, so the current lower-ID tie-break gives it to the wider
+        // cell and leaves the narrower cell with no CPU.
+        let wide_path = tmp.path().join("cell_a_wide");
+        std::fs::create_dir(&wide_path).unwrap();
+        std::fs::write(wide_path.join("cpuset.cpus"), "0-1\n").unwrap();
+
+        let narrow_path = tmp.path().join("cell_b_narrow");
+        std::fs::create_dir(&narrow_path).unwrap();
+        std::fs::write(narrow_path.join("cpuset.cpus"), "0\n").unwrap();
+
+        let mgr = CellManager::new_with_path(
+            tmp.path().to_path_buf(),
+            256,
+            cpumask_for_range(5),
+            HashSet::new(),
+        )
+        .unwrap();
+
+        assert_eq!(mgr.find_cell_by_name("cell_a_wide").unwrap().cell_id, 1);
+        assert_eq!(mgr.find_cell_by_name("cell_b_narrow").unwrap().cell_id, 2);
+
+        let assignments = mgr
+            .compute_cpu_assignments(false)
+            .expect("a feasible assignment must not starve the narrower cell");
+        let narrow = assignments
+            .iter()
+            .find(|assignment| assignment.cell_id == 2)
+            .expect("narrower cell must have an assignment");
+
+        assert_eq!(narrow.primary.weight(), 1);
+        assert!(narrow.primary.test_cpu(0));
+    }
+
+    #[test]
+    fn test_cpu_assignments_fragmented_overlap_across_ccxs_does_not_starve_cell() {
+        const NR_CCXS: usize = 8;
+        const CPUS_PER_CCX: usize = 12;
+        const SHARED_CPUS_PER_CCX: usize = 4;
+
+        let tmp = TempDir::new().unwrap();
+        let mut shared_cpus = Vec::new();
+        let mut helper_cpus = Vec::new();
+        let mut cpu_to_llc = HashMap::new();
+
+        // Model eight CCXs with twelve CPUs each. In every CCX:
+        // - four CPUs are shared by two large cells;
+        // - four CPUs are private to helper cells;
+        // - four CPUs are unclaimed and available to cell 0.
+        //
+        // Each helper claims one shared CPU and one private CPU. This adds a
+        // unique claimant to every shared CPU, fragmenting the 32 shared CPUs
+        // into 32 separate one-CPU contention groups.
+        for ccx in 0..NR_CCXS {
+            let base = ccx * CPUS_PER_CCX;
+            for offset in 0..CPUS_PER_CCX {
+                cpu_to_llc.insert(base + offset, ccx);
+            }
+            for offset in 0..SHARED_CPUS_PER_CCX {
+                shared_cpus.push(base + offset);
+                helper_cpus.push((base + offset, base + SHARED_CPUS_PER_CCX + offset));
+            }
+        }
+
+        let shared_cpulist = shared_cpus
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let favored_path = tmp.path().join("cell_a_favored");
+        std::fs::create_dir(&favored_path).unwrap();
+        std::fs::write(
+            favored_path.join("cpuset.cpus"),
+            format!("{shared_cpulist}\n"),
+        )
+        .unwrap();
+
+        let starved_path = tmp.path().join("cell_b_starved");
+        std::fs::create_dir(&starved_path).unwrap();
+        std::fs::write(
+            starved_path.join("cpuset.cpus"),
+            format!("{shared_cpulist}\n"),
+        )
+        .unwrap();
+
+        for (idx, (shared_cpu, private_cpu)) in helper_cpus.iter().copied().enumerate() {
+            let helper_path = tmp.path().join(format!("cell_helper_{idx:02}"));
+            std::fs::create_dir(&helper_path).unwrap();
+            std::fs::write(
+                helper_path.join("cpuset.cpus"),
+                format!("{shared_cpu},{private_cpu}\n"),
+            )
+            .unwrap();
+        }
+
+        let mgr = CellManager::new_with_path_opts(
+            tmp.path().to_path_buf(),
+            256,
+            cpumask_for_range(NR_CCXS * CPUS_PER_CCX),
+            HashSet::new(),
+            NR_CCXS * (CPUS_PER_CCX - 2 * SHARED_CPUS_PER_CCX),
+            cpu_to_llc,
+        )
+        .unwrap();
+
+        let favored_id = mgr.find_cell_by_name("cell_a_favored").unwrap().cell_id;
+        let starved_id = mgr.find_cell_by_name("cell_b_starved").unwrap().cell_id;
+        assert_eq!(favored_id, 1);
+        assert_eq!(starved_id, 2);
+
+        let mut demands: HashMap<u32, f64> =
+            mgr.cells.values().map(|cell| (cell.cell_id, 0.0)).collect();
+        demands.insert(favored_id, 1000.0);
+        demands.insert(starved_id, 1.0);
+
+        let assignments = mgr
+            .compute_demand_cpu_assignments(&demands, false)
+            .expect("a feasible assignment must not starve a large overlapping cell");
+        let starved = assignments
+            .iter()
+            .find(|assignment| assignment.cell_id == starved_id)
+            .expect("lower-demand overlapping cell must have an assignment");
+
+        assert_eq!(starved.primary.weight(), 1);
+        assert!(
+            shared_cpus.iter().any(|&cpu| starved.primary.test_cpu(cpu)),
+            "lower-demand cell must receive one of its 32 shared CPUs"
+        );
+    }
+
+    #[test]
     fn test_cpu_assignments_partial_overlap() {
         let tmp = TempDir::new().unwrap();
 
