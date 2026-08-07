@@ -86,11 +86,46 @@ impl MitosisTopology {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn check_llc(llc_to_cpus: &[llc_cpumask; MAX_LLCS], llc: usize, cpu: usize) -> bool {
         let long_idx = cpu / 64;
         let bit_idx = cpu % 64;
         llc_to_cpus[llc].bits[long_idx] & (1u64 << bit_idx) != 0
+    }
+
+    fn prev(
+        topo: &Topology,
+    ) -> (
+        [u32; bpf_intf::consts_MAX_CPUS as usize],
+        [llc_cpumask; MAX_LLCS],
+    ) {
+        let mut cpu_to_llc = [0u32; bpf_intf::consts_MAX_CPUS as usize];
+        for cpu in 0..*scx_utils::NR_CPUS_POSSIBLE {
+            cpu_to_llc[cpu] = topo.all_cpus.get(&cpu).map(|c| c.llc_id).unwrap_or(0) as u32;
+        }
+
+        let mut llc_to_cpu_ids: HashMap<usize, Vec<usize>> = HashMap::new();
+        for cpu in topo.all_cpus.values() {
+            llc_to_cpu_ids.entry(cpu.llc_id).or_default().push(cpu.id);
+        }
+
+        let mut llc_to_cpus = [llc_cpumask {
+            bits: [0; CPUMASK_LONG_ENTRIES],
+        }; MAX_LLCS];
+        for (llc_id, cpus) in llc_to_cpu_ids {
+            let mut cpumask_longs = [0u64; CPUMASK_LONG_ENTRIES];
+            for cpu in cpus {
+                let long_idx = cpu / 64;
+                let bit_idx = cpu % 64;
+                if long_idx < CPUMASK_LONG_ENTRIES {
+                    cpumask_longs[long_idx] |= 1u64 << bit_idx;
+                }
+            }
+            llc_to_cpus[llc_id].bits = cpumask_longs;
+        }
+
+        (cpu_to_llc, llc_to_cpus)
     }
 
     #[test]
@@ -119,7 +154,6 @@ mod tests {
         let mut llc_to_cpus = [llc_cpumask {
             bits: [0; CPUMASK_LONG_ENTRIES],
         }; MAX_LLCS];
-
         mitosis_topology
             .apply_arrays(&mut cpu_to_llc, &mut llc_to_cpus)
             .unwrap();
@@ -142,6 +176,27 @@ mod tests {
             if llc + 1 < MAX_LLCS {
                 assert!(!check_llc(&llc_to_cpus, llc, last_cpu + 1));
             }
+        }
+    }
+
+    #[test]
+    fn verify() {
+        let (topo, _) = scx_utils::testutils::make_test_topo(1, 16, 8, 2);
+        let mitosis_topology = MitosisTopology::new(&topo);
+
+        let mut cpu_to_llc = [0u32; bpf_intf::consts_MAX_CPUS as usize];
+        let mut llc_to_cpus = [llc_cpumask {
+            bits: [0; CPUMASK_LONG_ENTRIES],
+        }; MAX_LLCS];
+        mitosis_topology
+            .apply_arrays(&mut cpu_to_llc, &mut llc_to_cpus)
+            .unwrap();
+
+        let (legacy_cpu_to_llc, legacy_llc_to_cpus) = prev(&topo);
+
+        assert_eq!(cpu_to_llc, legacy_cpu_to_llc);
+        for llc in 0..MAX_LLCS {
+            assert_eq!(llc_to_cpus[llc].bits, legacy_llc_to_cpus[llc].bits);
         }
     }
 }
