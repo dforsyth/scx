@@ -56,6 +56,7 @@ use scx_utils::NR_CPUS_POSSIBLE;
 use tracing::{debug, info, trace, warn};
 use tracing_subscriber::filter::EnvFilter;
 
+use mitosis_topology_utils::MitosisTopology;
 use stats::CellMetrics;
 use stats::Metrics;
 
@@ -411,21 +412,10 @@ impl<'a> Scheduler<'a> {
             v => skel.struct_ops.mitosis_mut().flags |= v,
         }
 
-        // Populate LLC topology arrays before load (data section is only writable before load)
-        mitosis_topology_utils::populate_topology_maps(
-            &mut skel,
-            mitosis_topology_utils::MapKind::CpuToLLC,
-            &topology,
-            None,
-        )
-        .context("populating CPU-to-LLC topology map")?;
-        mitosis_topology_utils::populate_topology_maps(
-            &mut skel,
-            mitosis_topology_utils::MapKind::LLCToCpus,
-            &topology,
-            None,
-        )
-        .context("populating LLC-to-CPUs topology map")?;
+        let mitosis_topology = MitosisTopology::new(&topology);
+        mitosis_topology
+            .apply(&mut skel)
+            .context("mitosis_topology.apply")?;
 
         let skel = scx_ops_load!(skel, mitosis, uei).context("loading BPF skeleton")?;
 
